@@ -16,8 +16,10 @@ copy it, press the key, paste it back as native English.
   notification shows progress and a preview; the clipboard is left untouched if
   the rewrite fails.
 
-Cleanup runs on Cerebras (`qwen-3.8-27b`, OpenAI-compatible Chat Completions) and
-adds roughly 150 to 250 ms after transcription. If the API is unreachable, slow, or
+Cleanup works with any OpenAI-compatible Chat Completions API: OpenAI, Groq,
+OpenRouter, a local Ollama or vLLM server, and so on. The default is Cerebras
+(`qwen-3.8-27b`), which adds roughly 150 to 250 ms after transcription; see
+[Choose the provider](#choose-the-provider). If the API is unreachable, slow, or
 returns anything unusable, the raw transcription is typed instead. Dictation never
 silently fails; at worst it is not cleaned up.
 
@@ -31,8 +33,9 @@ Shift + Meta + F23. See [Change the keys](#change-the-keys) for anything else.
   build shipped with Omarchy works. `whisper.language = "auto"` is recommended so
   the same key works for every language you speak.
 - `curl`, `jq` 1.7 or later, `wl-clipboard` and `notify-send`. All ship with Omarchy.
-- A Cerebras API key from <https://cloud.cerebras.ai/>. Each dictation is one chat
-  completion billed to that account, and the dictated text leaves your machine.
+- An API key for your provider (by default Cerebras, from <https://cloud.cerebras.ai/>).
+  Each dictation is one chat completion billed to that account, and the dictated
+  text leaves your machine unless the server is local.
 
 ## Install
 
@@ -52,7 +55,7 @@ confirmation, then for your API key (input hidden). The installer:
 3. Appends a managed block with the dictation and clipboard key bindings to
    `~/.config/hypr/bindings.lua`.
 4. Creates `~/.config/voxtype/vocabulary.txt` from the example if you have none.
-5. Stores the key in `~/.config/cerebras/api_key` with owner-only permissions.
+5. Stores the key in `~/.config/omarchy-dictation/api_key` with owner-only permissions.
 6. Restarts Voxtype, reloads Hyprland, checks for configuration errors and confirms
    both profiles are available. If anything fails, every change is reverted.
 
@@ -76,7 +79,10 @@ replaces its managed blocks with the new values.
   "chords": ["SUPER + D"],
   "translate_key": "Shift_R",
   "post_process_timeout_ms": 20000,
-  "polish_chord": "SUPER + SHIFT + T"
+  "polish_chord": "SUPER + SHIFT + T",
+  "base_url": "https://api.cerebras.ai/v1",
+  "model": "qwen-3.8-27b",
+  "reasoning_effort": "none"
 }
 ```
 
@@ -86,6 +92,33 @@ key as Alt. `translate_key` is an XKB key name checked with `hl.is_key_down` whi
 the chord is pressed. `post_process_timeout_ms` is how long Voxtype waits for the
 cleanup before typing the raw text. `polish_chord` is the clipboard key; set it to
 `null` to leave the clipboard feature out.
+
+## Choose the provider
+
+`base_url`, `model` and `reasoning_effort` in the same `settings.json` select the
+LLM. `voxtype-llm` reads them on every call, so changes take effect immediately. Put
+the provider's key in `~/.config/omarchy-dictation/api_key` (mode 0600, one line).
+Re-running the installer validates the settings and prompts for a key if the file is
+missing.
+
+| Provider | `base_url` |
+| --- | --- |
+| Cerebras (default) | `https://api.cerebras.ai/v1` |
+| OpenAI | `https://api.openai.com/v1` |
+| Groq | `https://api.groq.com/openai/v1` |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| Ollama (local) | `http://localhost:11434/v1` |
+
+`model` is any chat model ID the provider lists. Small, fast models suit dictation.
+`reasoning_effort` is sent as-is. Use `null` for models that do not reason or that
+reject the field. Plain `http` is accepted only for localhost. A local server that
+needs no key still needs a non-empty key file; any text will do.
+
+The script first asks for a strict JSON-schema reply. If the server rejects the
+request (HTTP 400 or 422), it retries once with only the model, messages and token
+limit. This works with servers that lack structured outputs, `temperature` or
+`reasoning_effort`, at the cost of an extra round trip. Set `reasoning_effort` to
+`null` if the log shows the retry on every dictation.
 
 ## Vocabulary
 
@@ -124,10 +157,11 @@ instructions" come back rewritten, not obeyed. This is defence in depth, not a
 guarantee; the model still chooses the wording. Whatever is in the clipboard when
 you press the polish key is sent to the API, so check it first.
 
-The key is read from a mode-0600 file and never passed on a command line. The
-script also honours `CEREBRAS_API_KEY`, `CEREBRAS_API_KEY_FILE`, `CEREBRAS_MODEL`,
-`CEREBRAS_BASE_URL` and `VOXTYPE_VOCABULARY_FILE` for manual use, but the systemd
-user session does not inherit shell variables, which is why the file is the default.
+The key is read from a mode-0600 file and never passed on a command line. For
+manual use, the script also honours `VOXTYPE_LLM_API_KEY`, `VOXTYPE_LLM_API_KEY_FILE`,
+`VOXTYPE_LLM_BASE_URL`, `VOXTYPE_LLM_MODEL`, `VOXTYPE_LLM_SETTINGS_FILE` and
+`VOXTYPE_VOCABULARY_FILE`. The systemd user session does not inherit shell
+variables, so the files are the default.
 
 ## Remove
 
