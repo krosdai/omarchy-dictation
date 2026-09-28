@@ -6,7 +6,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,7 +45,7 @@ class InstallerTests(unittest.TestCase):
             bindings=root / "hypr/bindings.lua",
             settings=root / "omarchy-dictation/settings.json",
             vocabulary=root / "voxtype/vocabulary.txt",
-            api_key=root / "cerebras/api_key",
+            api_key=root / "omarchy-dictation/api_key",
             bin_dir=root / "bin",
             state=root / "state",
         )
@@ -111,7 +113,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_settings_change_replaces_the_managed_block(self):
         self.apply()
-        self.paths.settings.parent.mkdir(parents=True)
+        self.paths.settings.parent.mkdir(parents=True, exist_ok=True)
         self.paths.settings.write_text(
             json.dumps({"chords": ["SUPER + D"], "translate_key": "Alt_R", "polish_chord": None})
         )
@@ -189,7 +191,7 @@ class InstallerTests(unittest.TestCase):
             install.edit_block(added + block, block, install.LUA_BEGIN, install.LUA_END)
 
     def test_settings_validation(self):
-        self.paths.settings.parent.mkdir(parents=True)
+        self.paths.settings.parent.mkdir(parents=True, exist_ok=True)
         for bad in (
             {"chords": []},
             {"chords": ["SUPER + ; rm -rf"]},
@@ -199,6 +201,19 @@ class InstallerTests(unittest.TestCase):
             {"polish_chord": "SUPER + T; rm"},
             {"polish_chord": ["SUPER + T"]},
             {"unknown": 1},
+            {"base_url": "ftp://example.com/v1"},
+            {"base_url": "http://api.example.com/v1"},
+            {"base_url": "https:///v1"},
+            {"base_url": "https://api.example.com/v1#x"},
+            {"base_url": "https://api.example.com/v1?x=1"},
+            {"base_url": "http://localhost:x@evil.example/v1"},
+            {"base_url": "https://user@api.example.com/v1"},
+            {"base_url": "https://api.example.com:notaport/v1"},
+            {"base_url": "https://api.example.com:99999/v1"},
+            {"model": ""},
+            {"model": "gpt 5"},
+            {"reasoning_effort": "none; rm"},
+            {"reasoning_effort": 1},
         ):
             with self.subTest(bad=bad):
                 self.paths.settings.write_text(json.dumps(bad))
@@ -208,6 +223,17 @@ class InstallerTests(unittest.TestCase):
         settings = install.load_settings(self.paths.settings)
         self.assertEqual(settings["post_process_timeout_ms"], 5000)
         self.assertEqual(settings["chords"], install.DEFAULT_SETTINGS["chords"])
+        self.paths.settings.write_text(
+            json.dumps(
+                {
+                    "base_url": "http://localhost:11434/v1",
+                    "model": "qwen3:8b",
+                    "reasoning_effort": None,
+                }
+            )
+        )
+        settings = install.load_settings(self.paths.settings)
+        self.assertEqual(install.api_host(settings), "localhost:11434")
 
     def test_missing_api_key_aborts_before_touching_files(self):
         with (
@@ -219,7 +245,142 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
 
 
+class FakeProvider(BaseHTTPRequestHandler):
+    """OpenAI-compatible endpoint that records requests and answers from a script."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.requests.append((self.path, self.headers["Authorization"], body))
+        status, reply = self.server.replies.pop(0)
+        data = json.dumps(reply).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
 class ScriptTests(unittest.TestCase):
+    def call_provider(self, settings, replies, host="127.0.0.1"):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+        server.requests, server.replies = [], replies
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as config:
+            settings_file = Path(config, "settings.json")
+            base_url = f"http://{host}:{server.server_port}/v1/"
+            settings_file.write_text(json.dumps({"base_url": base_url, **settings}))
+            result = subprocess.run(
+                ["bash", str(ROOT / "voxtype-llm"), "--mode", "translate"],
+                input="你好",
+                capture_output=True,
+                text=True,
+                env={
+                    "HOME": "/nonexistent",
+                    "PATH": "/usr/bin:/bin",
+                    "VOXTYPE_LLM_API_KEY": "test-key",
+                    "VOXTYPE_LLM_SETTINGS_FILE": str(settings_file),
+                    # A dead proxy: local providers must be reached directly.
+                    "http_proxy": "http://127.0.0.1:9",
+                    "ALL_PROXY": "http://127.0.0.1:9",
+                },
+                check=True,
+            )
+        return result, server.requests
+
+    def test_settings_select_the_provider(self):
+        answer = {"choices": [{"message": {"content": '{"text": "Hello"}'}}]}
+        result, requests = self.call_provider({"model": "local-model"}, [(200, answer)])
+        self.assertEqual(result.stdout, "Hello")
+        path, auth, body = requests[0]
+        self.assertEqual((path, auth), ("/v1/chat/completions", "Bearer test-key"))
+        self.assertEqual(body["model"], "local-model")
+        self.assertEqual(body["reasoning_effort"], "none")
+        self.assertIn("response_format", body)
+
+        result, requests = self.call_provider(
+            {"reasoning_effort": None}, [(200, answer)], host="LOCALHOST"
+        )
+        self.assertEqual(result.stdout, "Hello")
+        self.assertEqual(requests[0][2]["model"], install.DEFAULT_SETTINGS["model"])
+        self.assertNotIn("reasoning_effort", requests[0][2])
+
+    def test_explicit_invalid_settings_fail_closed(self):
+        for settings in (
+            {"base_url": None},
+            {"model": False},
+            {"model": "", "reasoning_effort": None},
+            {"base_url": ""},
+            {"reasoning_effort": 1},
+        ):
+            with self.subTest(settings=settings), tempfile.TemporaryDirectory() as config:
+                settings_file = Path(config, "settings.json")
+                settings_file.write_text(json.dumps(settings))
+                result = subprocess.run(
+                    ["bash", str(ROOT / "voxtype-llm"), "--mode", "rephrase"],
+                    input="hello world",
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "HOME": "/nonexistent",
+                        "PATH": "/usr/bin:/bin",
+                        "VOXTYPE_LLM_API_KEY": "test-key",
+                        "VOXTYPE_LLM_SETTINGS_FILE": str(settings_file),
+                    },
+                    check=True,
+                )
+                self.assertEqual(result.stdout, "hello world")
+                self.assertIn("cannot read", result.stderr)
+
+    def test_rejected_request_is_retried_without_optional_fields(self):
+        answer = {"choices": [{"message": {"content": '{"text": "Hello"}'}}]}
+        result, requests = self.call_provider(
+            {}, [(400, {"error": "unsupported parameter"}), (200, answer)]
+        )
+        self.assertEqual(result.stdout, "Hello")
+        self.assertEqual(len(requests), 2)
+        minimal = requests[1][2]
+        self.assertEqual(set(minimal), {"model", "max_completion_tokens", "messages"})
+
+    def test_script_defaults_match_the_installer(self):
+        script = (ROOT / "voxtype-llm").read_text()
+        defaults = install.DEFAULT_SETTINGS
+        self.assertIn(f'DEFAULT_BASE_URL="{defaults["base_url"]}"', script)
+        self.assertIn(f'DEFAULT_MODEL="{defaults["model"]}"', script)
+        self.assertIn(f'DEFAULT_REASONING_EFFORT="{defaults["reasoning_effort"]}"', script)
+
+    def test_unsafe_base_urls_are_refused(self):
+        for url in (
+            "http://api.example.com/v1",
+            "http://localhost:x@evil.example/v1",
+            "http://localhost@evil.example",
+            "https://api.example.com/v1#x",
+            "https://api.example.com/v1?x=1",
+            "ftp://api.example.com/v1",
+        ):
+            with self.subTest(url=url):
+                result = subprocess.run(
+                    ["bash", str(ROOT / "voxtype-llm"), "--mode", "rephrase"],
+                    input="hello world",
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "HOME": "/nonexistent",
+                        "PATH": "/usr/bin:/bin",
+                        "VOXTYPE_LLM_API_KEY": "test-key",
+                        "VOXTYPE_LLM_BASE_URL": url,
+                    },
+                    check=True,
+                )
+                self.assertEqual(result.stdout, "hello world")
+                self.assertIn("base_url must be https", result.stderr)
+
     def test_script_parses_and_passes_input_through_without_key(self):
         script = ROOT / "voxtype-llm"
         subprocess.run(["bash", "-n", str(script)], check=True)
@@ -231,7 +392,7 @@ class ScriptTests(unittest.TestCase):
             env={
                 "HOME": "/nonexistent",
                 "PATH": "/usr/bin:/bin",
-                "CEREBRAS_API_KEY_FILE": "/nonexistent",
+                "VOXTYPE_LLM_API_KEY_FILE": "/nonexistent",
             },
             check=True,
         )
@@ -245,7 +406,7 @@ class ScriptTests(unittest.TestCase):
             env={
                 "HOME": "/nonexistent",
                 "PATH": "/usr/bin:/bin",
-                "CEREBRAS_API_KEY_FILE": "/nonexistent",
+                "VOXTYPE_LLM_API_KEY_FILE": "/nonexistent",
             },
         )
         self.assertEqual((strict.returncode, strict.stdout), (1, ""))
