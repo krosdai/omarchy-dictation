@@ -1,118 +1,140 @@
-# Omarchy Dictation
+# Omarchy Dictation Cleanup
 
-Push-to-talk dictation for Omarchy/Hyprland using one existing Voxtype daemon:
+Hold a key, speak, release: Voxtype transcribes, an LLM tidies the text, and the
+result is typed at your cursor.
 
-- **Hold F9:** transcribe speech in its original language.
-- **Hold Shift+F9:** transcribe, then translate to English.
-- **Release F9:** stop recording and type at the cursor, with Voxtype's clipboard fallback.
+- **Hold the dictation key:** Whisper transcribes in whatever language you spoke.
+  The transcript is rewritten as clean prose in that same language: fillers, false
+  starts and punctuation fixed, nothing translated.
+- **Hold Right Shift as well:** the same transcript is rendered as native English.
+- **Release:** recording stops and Voxtype types the result, with its usual
+  clipboard fallback.
 
-Wait for the previous utterance's output to finish and Voxtype to return to idle
-before pressing F9 again, with or without Shift. Do not queue recordings while
-transcription or translation is pending.
+Cleanup runs on Cerebras (`qwen-3.8-27b`, OpenAI-compatible Chat Completions) and
+adds roughly 150 to 250 ms after transcription. If the API is unreachable, slow, or
+returns anything unusable, the raw transcription is typed instead. Dictation never
+silently fails; at worst it is not cleaned up.
 
-Audio goes to xAI's `grok-voice-transcribe-2.0`; translation uses `grok-4.6` by
-default. This is a standalone Voxtype integration, not an Amp plugin. Requires
-Python 3.11+, Voxtype with remote Whisper and profiles (tested against 1.0.1),
-and the existing Wayland typing/clipboard tools. No Python packages are required.
+The default key is the Copilot key found on recent laptops, which Hyprland sees as
+Shift + Meta + F23. See [Change the keys](#change-the-keys) for anything else.
 
-## Try the adapter
+## Requirements
 
-Set `SPACEXAI_API_KEY` or `XAI_API_KEY` in your environment. The former takes
-precedence. Never put the key in this repository or Hyprland bindings.
+- Omarchy with Lua-based Hyprland configuration and a running Hyprland session.
+- Voxtype 1.1 or later with the Whisper engine and profile support. The Vulkan
+  build shipped with Omarchy works. `whisper.language = "auto"` is recommended so
+  the same key works for every language you speak.
+- `curl` and `jq` 1.7 or later. Both ship with Omarchy.
+- A Cerebras API key from <https://cloud.cerebras.ai/>. Each dictation is one chat
+  completion billed to that account, and the dictated text leaves your machine.
 
-```sh
-make test
-python3 dictation.py serve
-```
+## Install
 
-In another terminal:
-
-```sh
-curl -fsS http://127.0.0.1:8765/health
-printf '明天下午三点开会。' | python3 dictation.py translate
-curl -fsS http://127.0.0.1:8765/v1/audio/transcriptions -F file=@sample.wav
-```
-
-These last two commands send text/audio to xAI and incur API usage charges.
-`/health` checks the local process, not API credentials. To change translation
-models, set `DICTATION_TRANSLATION_MODEL` before starting the adapter.
-
-## Install and enable
-
-`make install` copies the program and a user service; it does not enable anything
-or change Voxtype/Hyprland. Stop the foreground adapter before enabling the service.
+Review this repository, then add and enable the plugin:
 
 ```sh
-make install
-install -d -m 700 ~/.config/omarchy-dictation
-(umask 077; printf 'SPACEXAI_API_KEY=%s\n' "${SPACEXAI_API_KEY:-$XAI_API_KEY}" > ~/.config/omarchy-dictation/environment)
-systemctl --user daemon-reload
-systemctl --user enable --now omarchy-dictation.service
+omarchy plugin add https://github.com/krosdai/omarchy-dictation.git --enable
 ```
 
-The environment file persists your key in plaintext with owner-only permissions.
-Systemd does not inherit arbitrary variables from your interactive shell.
+The first enable opens a terminal that explains what will change and asks for
+confirmation, then for your API key (input hidden). The installer:
 
-Back up `~/.config/voxtype/config.toml` and `~/.config/hypr/bindings.lua` first.
-Merge [the Voxtype settings](examples/voxtype.toml) into existing sections rather
-than appending duplicate TOML tables. Preserve audio, OSD, and other output
-preferences. Remove any global `[output.post_process]` translation command;
-translation belongs only in `[profiles.translate]`. The profile command is run
-through Voxtype's shell, which expands `~`.
+1. Copies `voxtype-llm` and its two command names into `~/.local/bin`.
+2. Appends a managed block with `[profiles.rephrase]` and `[profiles.translate]` to
+   `~/.config/voxtype/config.toml`.
+3. Appends a managed block with the key bindings to `~/.config/hypr/bindings.lua`.
+4. Creates `~/.config/voxtype/vocabulary.txt` from the example if you have none.
+5. Stores the key in `~/.config/cerebras/api_key` with owner-only permissions.
+6. Restarts Voxtype, reloads Hyprland, checks for configuration errors and confirms
+   both profiles are available. If anything fails, every change is reverted.
 
-Add [the Lua bindings](examples/bindings.lua) to your personal bindings file after
-Omarchy's defaults. For older Hyprland configurations using `.conf`, the equivalent is:
+Both configuration files are backed up under `~/.local/state/omarchy-dictation/`
+first. The installer refuses to run if either profile name or either chord is
+already configured by hand; remove those first.
 
-```ini
-unbind = , F9
-unbind = SHIFT, F9
-bind = , F9, exec, voxtype record start
-bind = SHIFT, F9, exec, voxtype record start --profile translate
-bindrt = , F9, exec, voxtype record stop
-bindrt = SHIFT, F9, exec, voxtype record stop
+You can also run it directly:
+
+```sh
+/usr/bin/python ~/.config/omarchy/plugins/krosdai.dictation/install.py
 ```
 
-Then restart Voxtype with `systemctl --user restart voxtype` and reload Hyprland
-with `hyprctl reload`. Logs: `journalctl --user -u omarchy-dictation -u voxtype`.
-To roll back, restore your two configuration backups, restart Voxtype/reload
-Hyprland, and run `systemctl --user disable --now omarchy-dictation`.
+## Change the keys
 
-## Behavior and limitations
+Create `~/.config/omarchy-dictation/settings.json`, then re-run the installer. It
+replaces its managed blocks with the new values.
 
-- The adapter listens only on `127.0.0.1:8765`. It rebuilds Voxtype's multipart
-  upload with the explicit xAI model first and the WAV file last. Whisper-only
-  fields are dropped; xAI detects the language. Uploads are limited to 8 MiB
-  (a 60-second, 16-kHz mono PCM recording is approximately 1.9 MiB).
-- Translation reads stdin and prints only translated text. Failures exit nonzero.
-  **Voxtype falls back to the original transcript on translation failure**, including
-  its 30-second timeout. Shift+F9 therefore does not guarantee English on failure.
-- **Voxtype 1.0.1 loses the selected profile when the 60-second audio cap stops a
-  recording automatically.** Release F9 before the cap; otherwise Shift+F9 can
-  output untranslated text. The adapter cannot recover a profile Voxtype discarded.
-- **Use one utterance at a time.** Voxtype 1.0.1 stores the selected profile in a
-  shared override file and reads it after transcription. A new Shift+F9 press
-  while busy can change the previous utterance's mode even though the new start
-  is ignored. Waiting for completed output and idle is the short-term workaround;
-  the adapter does not enforce this or maintain a recording queue. A failed
-  recording start can also leave a stale profile: waiting alone does not clear it.
-  If capture fails, resolve the failure and check profile state before resuming;
-  do not assume the next plain F9 recording will be untranslated.
-- Both F9 release bindings use `transparent = true` (`t` in legacy config) to
-  prevent shadowing when Shift is released while F9 remains held. Verify both
-  release orders on your desktop before relying on this. Modifier waiting requires
-  readable `/dev/input` devices; Voxtype silently skips it without access. Release
-  Shift promptly: with device access, the example waits up to two seconds, then
-  falls back to the clipboard if a modifier is still held.
-- Audio and translated text are sent to xAI, not processed offline. The adapter
-  does not save recordings/transcripts or log request/response bodies. Voxtype and
-  clipboard history have their own retention behavior. Local processes can call
-  the adapter using your API account; it is not intended for untrusted multiuser
-  hosts. Browser-origin requests are rejected and no CORS access is granted.
+```json
+{
+  "chords": ["SUPER + D"],
+  "translate_key": "Shift_R",
+  "post_process_timeout_ms": 20000
+}
+```
 
-Before daily use, test Mandarin, English, mixed-language speech, and proper names
-in a scratch editor. Test releasing Shift before and after F9, clipboard fallback,
-and a failed translation. Measure release-to-output latency on your own audio.
-Offline tests cover HTTP/multipart contracts and the translation filter, not
-physical keys, microphone quality, OSD rendering, or cursor placement.
+`chords` are Hyprland bind chords; several are allowed, and the default lists two
+spellings of the Copilot key because Omarchy's default layout exposes the left Meta
+key as Alt. `translate_key` is an XKB key name checked with `hl.is_key_down` while
+the chord is pressed. `post_process_timeout_ms` is how long Voxtype waits for the
+cleanup before typing the raw text.
 
-API reference: [xAI speech-to-text](https://docs.x.ai/developers/model-capabilities/audio/speech-to-text).
+## Vocabulary
+
+`~/.config/voxtype/vocabulary.txt` lists one name or term per line. They are passed
+to the model as spellings to prefer whenever the transcript contains something that
+sounds like them, so `vox type` becomes `Voxtype`. The file is read on every
+dictation; edits take effect immediately.
+
+This fixes spelling after recognition. If Whisper cannot hear a term at all, add the
+same list to `whisper.initial_prompt` in the Voxtype config too; that biases
+recognition itself and needs `systemctl --user restart voxtype`.
+
+## Verify
+
+```sh
+hyprctl binds | grep -B2 -A3 F23           # press and release binds for each chord
+voxtype record start --profile __probe__   # "Available profiles: rephrase, translate"
+printf 'so um i think we should, we should move it to thursday' | voxtype-rephrase
+printf '这个功能挺好用的然后我们下周搞定' | voxtype-translate-en
+```
+
+The last two commands call the API. Logs: `journalctl --user -u voxtype`; the
+script reports failures on stderr, prefixed `voxtype-llm:`.
+
+## Security notes
+
+Dictated text is untrusted input to the model. The script sends it wrapped in
+`<transcript>` tags with instructions to treat it as data, neutralises tag-like
+text inside it, requires a strict JSON reply (`{"text": ...}`) through the API's
+`response_format`, and rejects replies that are empty, leak the delimiter, or grow
+to more than three times the input. Spoken phrases such as "ignore previous
+instructions" come back rewritten as speech, not obeyed. This is defence in depth,
+not a guarantee; the model still chooses the wording.
+
+The key is read from a mode-0600 file and never passed on a command line. The
+script also honours `CEREBRAS_API_KEY`, `CEREBRAS_API_KEY_FILE`, `CEREBRAS_MODEL`,
+`CEREBRAS_BASE_URL` and `VOXTYPE_VOCABULARY_FILE` for manual use, but the systemd
+user session does not inherit shell variables, which is why the file is the default.
+
+## Remove
+
+Disable the plugin, then remove its configuration explicitly:
+
+```sh
+omarchy plugin disable krosdai.dictation
+/usr/bin/python ~/.config/omarchy/plugins/krosdai.dictation/install.py --uninstall
+```
+
+This deletes the managed blocks and the three commands, restarts Voxtype and
+reloads Hyprland. Your other configuration, the API key and the vocabulary file are
+left in place. Disabling alone stops the launcher but changes nothing else.
+
+## Develop
+
+```sh
+python -m unittest discover -s tests -v
+omarchy plugin validate .
+```
+
+Tests exercise the installer against temporary directories with the system calls
+faked, and the script's syntax and fallback path; nothing touches the desktop or the
+API.

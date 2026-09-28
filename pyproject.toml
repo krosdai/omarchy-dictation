@@ -1,0 +1,12 @@
+[project]
+name = "omarchy-dictation"
+version = "0.1.0"
+description = "Omarchy plugin: hold-to-dictate with Voxtype and LLM cleanup on Cerebras"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

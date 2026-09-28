@@ -1,0 +1,16 @@
+# Vocabulary for the krosdai.dictation cleanup script (voxtype-llm).
+# One name or term per line, spelled exactly as you want it written.
+# Lines starting with # and blank lines are ignored. Edit freely; no restart needed.
+Omarchy
+Hyprland
+Voxtype
+Whisper
+Cerebras
+Qwen
+Krosdai
+Kros Dai
+Waybar
+Wayland
+systemd
+ydotool
+Copilot key
