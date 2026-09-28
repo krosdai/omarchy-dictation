@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Text rewriting via the Cerebras OpenAI-compatible Chat Completions API.
+# Text rewriting via any OpenAI-compatible Chat Completions API.
 #
 # Reads text on stdin and prints the rewritten text on stdout. Mode comes from
 # the program name (voxtype-rephrase / voxtype-translate-en, both symlinks to
@@ -15,15 +15,22 @@
 # Voxtype always types something; with --strict nothing is printed and the exit
 # status is 1 instead, for callers that must not mistake the input for a result.
 #
-# Env: CEREBRAS_API_KEY (or CEREBRAS_API_KEY_FILE, default ~/.config/cerebras/api_key),
-#      CEREBRAS_BASE_URL, CEREBRAS_MODEL, VOXTYPE_VOCABULARY_FILE.
+# Provider: base_url, model and reasoning_effort in
+# ~/.config/omarchy-dictation/settings.json (Cerebras by default), read on every
+# call. The key is in ~/.config/omarchy-dictation/api_key.
+# Env overrides: VOXTYPE_LLM_API_KEY, VOXTYPE_LLM_API_KEY_FILE, VOXTYPE_LLM_BASE_URL,
+#                VOXTYPE_LLM_MODEL, VOXTYPE_LLM_SETTINGS_FILE, VOXTYPE_VOCABULARY_FILE.
 # Needs: bash 4+, curl, jq 1.7+.
 set -uo pipefail
 
-MODEL="${CEREBRAS_MODEL:-qwen-3.8-27b}"
-ENDPOINT="${CEREBRAS_BASE_URL:-https://api.cerebras.ai/v1}/chat/completions"
-KEY_FILE="${CEREBRAS_API_KEY_FILE:-$HOME/.config/cerebras/api_key}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-dictation"
+SETTINGS_FILE="${VOXTYPE_LLM_SETTINGS_FILE:-$CONFIG_DIR/settings.json}"
+KEY_FILE="${VOXTYPE_LLM_API_KEY_FILE:-$CONFIG_DIR/api_key}"
 VOCAB_FILE="${VOXTYPE_VOCABULARY_FILE:-$HOME/.config/voxtype/vocabulary.txt}"
+# Keep in sync with DEFAULT_SETTINGS in install.py.
+DEFAULT_BASE_URL="https://api.cerebras.ai/v1"
+DEFAULT_MODEL="qwen-3.8-27b"
+DEFAULT_REASONING_EFFORT="none"
 
 log() { printf 'voxtype-llm: %s\n' "$*" >&2; }
 usage() { printf 'usage: %s [--mode rephrase|translate|polish] [--strict] < text\n' "${0##*/}"; }
@@ -69,8 +76,32 @@ passthrough() {
   printf '%s' "$input"; exit 0
 }
 
+# ---------------------------------------------------------------- provider
+# A null reasoning_effort omits the field for providers that reject it.
+base_url="$DEFAULT_BASE_URL"; model="$DEFAULT_MODEL"; reasoning_effort="$DEFAULT_REASONING_EFFORT"
+if [ -e "$SETTINGS_FILE" ]; then
+  if ! provider="$(jq -er --arg url "$base_url" --arg model "$model" --arg effort "$reasoning_effort" '
+      if type != "object" then error("not an object") else . end
+      | [ (.base_url // $url), (.model // $model),
+          (if has("reasoning_effort") then (.reasoning_effort // "") else $effort end) ]
+      | map(tostring) | join("\n")' "$SETTINGS_FILE" 2>/dev/null)"; then
+    log "cannot read $SETTINGS_FILE; passing text through"
+    passthrough
+  fi
+  mapfile -t fields <<<"$provider"
+  base_url="${fields[0]}"; model="${fields[1]}"; reasoning_effort="${fields[2]:-}"
+fi
+base_url="${VOXTYPE_LLM_BASE_URL:-$base_url}"
+model="${VOXTYPE_LLM_MODEL:-$model}"
+# Dictated text must not cross the network in the clear.
+case "$base_url" in
+  https://?*|http://localhost|http://localhost[:/]*|http://127.0.0.1|http://127.0.0.1[:/]*|http://\[::1\]*) ;;
+  *) log "base_url must be https (plain http only for localhost): $base_url"; passthrough ;;
+esac
+ENDPOINT="${base_url%/}/chat/completions"
+
 # ---------------------------------------------------------------- key
-key="${CEREBRAS_API_KEY:-}"
+key="${VOXTYPE_LLM_API_KEY:-}"
 if [ -z "$key" ] && [ -r "$KEY_FILE" ]; then
   key="$(tr -d '[:space:]' < "$KEY_FILE")"
 fi
@@ -110,13 +141,12 @@ fi
 # The input is wrapped in <tag> tags; any tag-like text inside it is neutralised
 # so it cannot close or reopen the delimiter. Built entirely in jq so the text
 # is always JSON-escaped correctly.
-build_body() {  # $1 = "schema" | "plain"
-  jq -cn --arg model "$MODEL" --arg sys "$system_prompt" --arg user "$input" \
-    --arg tag "$tag" --argjson max_tokens "$max_tokens" --arg variant "$1" '
+build_body() {  # $1 = "full" | "minimal"
+  jq -cn --arg model "$model" --arg sys "$system_prompt" --arg user "$input" \
+    --arg tag "$tag" --argjson max_tokens "$max_tokens" --arg variant "$1" \
+    --arg effort "$reasoning_effort" '
     {
       model: $model,
-      temperature: 0.2,
-      reasoning_effort: "none",
       max_completion_tokens: $max_tokens,
       messages: [
         { role: "system", content: $sys },
@@ -126,7 +156,9 @@ build_body() {  # $1 = "schema" | "plain"
             + "\n</\($tag)>") }
       ]
     }
-    + (if $variant == "schema" then {
+    # Optional fields that not every OpenAI-compatible server or model accepts.
+    + (if $variant == "full" then {
+        temperature: 0.2,
         response_format: {
           type: "json_schema",
           json_schema: {
@@ -140,7 +172,8 @@ build_body() {  # $1 = "schema" | "plain"
             }
           }
         }
-      } else {} end)'
+      } + (if $effort != "" then { reasoning_effort: $effort } else {} end)
+      else {} end)'
 }
 
 # Returns the HTTP status in $status and the body in $response.
@@ -157,10 +190,10 @@ call_api() {  # $1 = body
 }
 
 status=""; response=""
-call_api "$(build_body schema)" || { log "request failed"; passthrough; }
-if [ "$status" = "400" ]; then
-  log "structured output rejected, retrying without schema: ${response:0:300}"
-  call_api "$(build_body plain)" || { log "request failed"; passthrough; }
+call_api "$(build_body full)" || { log "request failed"; passthrough; }
+if [ "$status" = "400" ] || [ "$status" = "422" ]; then
+  log "request rejected (HTTP $status), retrying without optional fields: ${response:0:300}"
+  call_api "$(build_body minimal)" || { log "request failed"; passthrough; }
 fi
 case "$status" in
   2??) ;;

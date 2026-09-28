@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,12 @@ DEFAULT_SETTINGS = {
     "post_process_timeout_ms": 20000,
     # Chord that rewrites the clipboard text as native English; null disables it.
     "polish_chord": "SUPER + SHIFT + T",
+    # Any OpenAI-compatible Chat Completions API; voxtype-llm reads these three on
+    # every call and keeps its own copy of the defaults.
+    "base_url": "https://api.cerebras.ai/v1",
+    "model": "qwen-3.8-27b",
+    # Sent as reasoning_effort; null omits it for models that do not accept it.
+    "reasoning_effort": "none",
 }
 
 
@@ -72,7 +79,7 @@ class Paths:
             bindings=config / "hypr/bindings.lua",
             settings=config / "omarchy-dictation/settings.json",
             vocabulary=config / "voxtype/vocabulary.txt",
-            api_key=config / "cerebras/api_key",
+            api_key=config / "omarchy-dictation/api_key",
             bin_dir=Path.home() / ".local/bin",
             state=state / "omarchy-dictation",
         )
@@ -104,7 +111,25 @@ def load_settings(path):
     polish = settings["polish_chord"]
     if polish is not None and not _is_chord(polish):
         raise ValueError("settings.polish_chord must be a Hyprland chord or null")
+    base_url = settings["base_url"]
+    url = urllib.parse.urlsplit(base_url) if isinstance(base_url, str) else None
+    if not url or url.scheme not in {"https", "http"} or not url.hostname or url.query:
+        raise ValueError(
+            "settings.base_url must be an http(s) URL such as https://api.openai.com/v1"
+        )
+    # Dictated text must not cross the network in the clear.
+    if url.scheme == "http" and url.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("settings.base_url may use plain http only for localhost")
+    if not isinstance(settings["model"], str) or not re.fullmatch(r"\S+", settings["model"]):
+        raise ValueError("settings.model must be a non-empty model name")
+    effort = settings["reasoning_effort"]
+    if effort is not None and not (isinstance(effort, str) and re.fullmatch(r"[a-z]+", effort)):
+        raise ValueError("settings.reasoning_effort must be a word such as none or low, or null")
     return settings
+
+
+def api_host(settings):
+    return urllib.parse.urlsplit(settings["base_url"]).netloc
 
 
 def _is_chord(value):
@@ -237,12 +262,14 @@ def remove_files(paths):
         (paths.bin_dir / name).unlink(missing_ok=True)
 
 
-def ensure_api_key(path, prompt=getpass.getpass):
+def ensure_api_key(path, host, prompt=getpass.getpass):
     if path.exists() and path.read_text().strip():
         return
-    key = prompt("Cerebras API key (input hidden, stored in " + str(path) + "): ").strip()
+    key = prompt(f"API key for {host} (input hidden, stored in {path}): ").strip()
     if not key:
-        raise ValueError("An API key is required; get one at https://cloud.cerebras.ai/")
+        raise ValueError(
+            f"An API key is required for {host}; for a server without keys enter any text."
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
     atomic_write(path, key + "\n", mode=0o600)
@@ -332,7 +359,7 @@ def apply(source, paths, remove=False, prompt=getpass.getpass):
     marker = paths.state / "installed.json"
 
     if not remove:
-        ensure_api_key(paths.api_key, prompt)
+        ensure_api_key(paths.api_key, api_host(settings), prompt)
     try:
         if remove:
             remove_files(paths)
@@ -408,11 +435,12 @@ def main():
                     if settings["polish_chord"]
                     else ""
                 )
-                + "  Dictated and clipboard text is sent to Cerebras (api.cerebras.ai),\n"
-                "  billed to you.\n"
+                + f"  Dictated and clipboard text is sent to {api_host(settings)}\n"
+                f"  ({settings['model']}), billed to your account there.\n"
                 f"  Managed blocks are appended to {paths.voxtype_config} and {paths.bindings};\n"
                 "  both files are backed up first. Voxtype is restarted and Hyprland reloaded.\n"
-                f"  Change keys or timeouts in {paths.settings} and re-run this installer."
+                f"  Change keys or timeouts in {paths.settings} and re-run this installer;\n"
+                "  the API provider and model there take effect immediately."
             )
         if input("Continue? [y/N] ").strip().lower() not in {"y", "yes"}:
             return
