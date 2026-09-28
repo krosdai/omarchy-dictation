@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Rewrite the text in the Wayland clipboard as native English, keeping its
+# paragraph and Markdown structure, and put the result back in the clipboard.
+# Meant for a key binding: copy a draft, press the key, paste the polished text.
+#
+# Uses `voxtype-llm --mode polish --strict` (same directory or PATH), so the
+# clipboard is only replaced when the rewrite actually succeeded. Progress and
+# errors are shown with notify-send.
+set -uo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+llm="$here/voxtype-llm"
+[ -x "$llm" ] || llm="voxtype-llm"
+
+app="Polish clipboard"
+notify_id=""
+notify() {  # $1 = urgency, $2 = title, $3 = body (Pango markup already escaped)
+  local id
+  id="$(notify-send -p -a "$app" -u "$1" ${notify_id:+-r "$notify_id"} -t "${4:-6000}" "$2" "$3" 2>/dev/null)" || return 0
+  case "$id" in *[!0-9]*|"") ;; *) notify_id="$id" ;; esac
+}
+escape() { local s="$1"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; printf '%s' "$s"; }
+
+for tool in wl-paste wl-copy; do
+  command -v "$tool" >/dev/null || { notify critical "$app" "$tool is not installed"; exit 1; }
+done
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+if ! wl-paste --no-newline --type text >"$work/input" 2>/dev/null; then
+  notify normal "$app" "The clipboard holds no text."
+  exit 1
+fi
+input="$(<"$work/input")"
+if [ -z "${input//[[:space:]]/}" ]; then
+  notify normal "$app" "The clipboard holds no text."
+  exit 1
+fi
+
+notify low "Polishing…" "$(escape "${input:0:120}")" 90000
+
+errors="$work/errors"
+if ! output="$(printf '%s' "$input" | "$llm" --mode polish --strict 2>"$errors")"; then
+  reason="$(tail -n 1 "$errors")"
+  notify critical "Polish failed" "$(escape "${reason#voxtype-llm: }")"
+  exit 1
+fi
+
+# Keep the same trailing newline convention as the original.
+[ "$(tail -c 1 "$work/input" | od -An -c | tr -d ' ')" = '\n' ] && output+=$'\n'
+printf '%s' "$output" | wl-copy
+
+notify normal "Polished English is in the clipboard" "$(escape "${output:0:200}")"

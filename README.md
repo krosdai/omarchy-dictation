@@ -1,7 +1,8 @@
 # Omarchy Dictation Cleanup
 
 Hold a key, speak, release: Voxtype transcribes, an LLM tidies the text, and the
-result is typed at your cursor.
+result is typed at your cursor. A second key does the same for text you wrote:
+copy it, press the key, paste it back as native English.
 
 - **Hold the dictation key:** Whisper transcribes in whatever language you spoke.
   The transcript is rewritten as clean prose in that same language: fillers, false
@@ -9,6 +10,11 @@ result is typed at your cursor.
 - **Hold Right Shift as well:** the same transcript is rendered as native English.
 - **Release:** recording stops and Voxtype types the result, with its usual
   clipboard fallback.
+- **Press Super + Shift + T:** the text in the clipboard, in any language and with
+  any Markdown formatting, is rewritten as native English with the same paragraphs,
+  headings, lists, links and code blocks, and put back in the clipboard. A
+  notification shows progress and a preview; the clipboard is left untouched if
+  the rewrite fails.
 
 Cleanup runs on Cerebras (`qwen-3.8-27b`, OpenAI-compatible Chat Completions) and
 adds roughly 150 to 250 ms after transcription. If the API is unreachable, slow, or
@@ -24,7 +30,7 @@ Shift + Meta + F23. See [Change the keys](#change-the-keys) for anything else.
 - Voxtype 1.1 or later with the Whisper engine and profile support. The Vulkan
   build shipped with Omarchy works. `whisper.language = "auto"` is recommended so
   the same key works for every language you speak.
-- `curl` and `jq` 1.7 or later. Both ship with Omarchy.
+- `curl`, `jq` 1.7 or later, `wl-clipboard` and `notify-send`. All ship with Omarchy.
 - A Cerebras API key from <https://cloud.cerebras.ai/>. Each dictation is one chat
   completion billed to that account, and the dictated text leaves your machine.
 
@@ -39,17 +45,19 @@ omarchy plugin add https://github.com/krosdai/omarchy-dictation.git --enable
 The first enable opens a terminal that explains what will change and asks for
 confirmation, then for your API key (input hidden). The installer:
 
-1. Copies `voxtype-llm` and its two command names into `~/.local/bin`.
+1. Copies `voxtype-llm`, its two command names and `polish-clipboard` into
+   `~/.local/bin`.
 2. Appends a managed block with `[profiles.rephrase]` and `[profiles.translate]` to
    `~/.config/voxtype/config.toml`.
-3. Appends a managed block with the key bindings to `~/.config/hypr/bindings.lua`.
+3. Appends a managed block with the dictation and clipboard key bindings to
+   `~/.config/hypr/bindings.lua`.
 4. Creates `~/.config/voxtype/vocabulary.txt` from the example if you have none.
 5. Stores the key in `~/.config/cerebras/api_key` with owner-only permissions.
 6. Restarts Voxtype, reloads Hyprland, checks for configuration errors and confirms
    both profiles are available. If anything fails, every change is reverted.
 
 Both configuration files are backed up under `~/.local/state/omarchy-dictation/`
-first. The installer refuses to run if either profile name or either chord is
+first. The installer refuses to run if either profile name or any of the chords is
 already configured by hand; remove those first.
 
 You can also run it directly:
@@ -67,7 +75,8 @@ replaces its managed blocks with the new values.
 {
   "chords": ["SUPER + D"],
   "translate_key": "Shift_R",
-  "post_process_timeout_ms": 20000
+  "post_process_timeout_ms": 20000,
+  "polish_chord": "SUPER + SHIFT + T"
 }
 ```
 
@@ -75,7 +84,8 @@ replaces its managed blocks with the new values.
 spellings of the Copilot key because Omarchy's default layout exposes the left Meta
 key as Alt. `translate_key` is an XKB key name checked with `hl.is_key_down` while
 the chord is pressed. `post_process_timeout_ms` is how long Voxtype waits for the
-cleanup before typing the raw text.
+cleanup before typing the raw text. `polish_chord` is the clipboard key; set it to
+`null` to leave the clipboard feature out.
 
 ## Vocabulary
 
@@ -95,20 +105,24 @@ hyprctl binds | grep -B2 -A3 F23           # press and release binds for each ch
 voxtype record start --profile __probe__   # "Available profiles: rephrase, translate"
 printf 'so um i think we should, we should move it to thursday' | voxtype-rephrase
 printf '这个功能挺好用的然后我们下周搞定' | voxtype-translate-en
+printf '## 今天\n\n- 把 clipboard 功能做完了' | voxtype-llm --mode polish
+printf 'some draft' | wl-copy && polish-clipboard && wl-paste
 ```
 
-The last two commands call the API. Logs: `journalctl --user -u voxtype`; the
-script reports failures on stderr, prefixed `voxtype-llm:`.
+The last four commands call the API. Logs: `journalctl --user -u voxtype`; the
+script reports failures on stderr, prefixed `voxtype-llm:`, and `polish-clipboard`
+shows them as notifications.
 
 ## Security notes
 
-Dictated text is untrusted input to the model. The script sends it wrapped in
-`<transcript>` tags with instructions to treat it as data, neutralises tag-like
-text inside it, requires a strict JSON reply (`{"text": ...}`) through the API's
-`response_format`, and rejects replies that are empty, leak the delimiter, or grow
-to more than three times the input. Spoken phrases such as "ignore previous
-instructions" come back rewritten as speech, not obeyed. This is defence in depth,
-not a guarantee; the model still chooses the wording.
+Dictated and clipboard text is untrusted input to the model. The script sends it
+wrapped in `<transcript>` (or `<draft>`) tags with instructions to treat it as data,
+neutralises tag-like text inside it, requires a strict JSON reply (`{"text": ...}`)
+through the API's `response_format`, and rejects replies that are empty, leak the
+delimiter, or grow far beyond the input. Phrases such as "ignore previous
+instructions" come back rewritten, not obeyed. This is defence in depth, not a
+guarantee; the model still chooses the wording. Whatever is in the clipboard when
+you press the polish key is sent to the API, so check it first.
 
 The key is read from a mode-0600 file and never passed on a command line. The
 script also honours `CEREBRAS_API_KEY`, `CEREBRAS_API_KEY_FILE`, `CEREBRAS_MODEL`,
@@ -124,7 +138,7 @@ omarchy plugin disable krosdai.dictation
 /usr/bin/python ~/.config/omarchy/plugins/krosdai.dictation/install.py --uninstall
 ```
 
-This deletes the managed blocks and the three commands, restarts Voxtype and
+This deletes the managed blocks and the four commands, restarts Voxtype and
 reloads Hyprland. Your other configuration, the API key and the vocabulary file are
 left in place. Disabling alone stops the launcher but changes nothing else.
 

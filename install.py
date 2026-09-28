@@ -2,9 +2,10 @@
 """Install or remove the krosdai.dictation setup for the current desktop user.
 
 The plugin adds two Voxtype profiles (`rephrase`, `translate`) backed by the
-`voxtype-llm` script, and a hold-to-dictate key binding in the user's Hyprland Lua
-bindings. Both edits are managed blocks between BEGIN/END markers; nothing outside
-the markers is ever rewritten.
+`voxtype-llm` script, a hold-to-dictate key binding in the user's Hyprland Lua
+bindings, and a second binding that rewrites the clipboard text as English through
+`polish-clipboard`. Both file edits are managed blocks between BEGIN/END markers;
+nothing outside the markers is ever rewritten.
 """
 
 import argparse
@@ -26,6 +27,7 @@ MIN_VOXTYPE = (1, 1)
 PROFILES = ("rephrase", "translate")
 COMMANDS = {"rephrase": "voxtype-rephrase", "translate": "voxtype-translate-en"}
 SCRIPT = "voxtype-llm"
+WRAPPER = "polish-clipboard"
 
 TOML_BEGIN = f"# BEGIN {ID}"
 TOML_END = f"# END {ID}"
@@ -41,6 +43,8 @@ DEFAULT_SETTINGS = {
     "translate_key": "Shift_R",
     # How long Voxtype waits for the cleanup script before typing the raw text.
     "post_process_timeout_ms": 20000,
+    # Chord that rewrites the clipboard text as native English; null disables it.
+    "polish_chord": "SUPER + SHIFT + T",
 }
 
 
@@ -96,6 +100,9 @@ def load_settings(path):
         raise ValueError(
             "settings.post_process_timeout_ms must be an integer between 1000 and 120000"
         )
+    polish = settings["polish_chord"]
+    if polish is not None and not _is_chord(polish):
+        raise ValueError("settings.polish_chord must be a Hyprland chord or null")
     return settings
 
 
@@ -116,9 +123,17 @@ def toml_block(bin_dir, timeout_ms):
     return "\n" + "\n".join(lines) + "\n"
 
 
-def lua_block(settings):
+def lua_block(settings, bin_dir):
     chords = ", ".join(json.dumps(chord) for chord in settings["chords"])
     translate_key = json.dumps(settings["translate_key"])
+    polish = ""
+    if settings["polish_chord"]:
+        chord, wrapper = json.dumps(settings["polish_chord"]), json.dumps(str(bin_dir / WRAPPER))
+        polish = f"""
+-- Copy a draft, press {settings["polish_chord"]}: the clipboard text is rewritten as
+-- native English (Markdown structure kept), then paste it.
+o.bind({chord}, "Polish clipboard text into English", {wrapper})
+"""
     return f"""
 {LUA_BEGIN}
 -- Managed by the {ID} Omarchy plugin; edit settings.json instead.
@@ -143,7 +158,7 @@ for _, chord in ipairs({{ {chords} }}) do
       hl.exec_cmd("voxtype record stop")
     end
   end, {{ release = true, transparent = true }})
-end
+end{polish}
 {LUA_END}
 """
 
@@ -177,8 +192,8 @@ def check_conflicts(voxtype_original, bindings_original, settings):
             raise ValueError(
                 f"[profiles.{profile}] already exists in the Voxtype config; remove it first."
             )
-    for chord in settings["chords"]:
-        if chord in bindings_original:
+    for chord in (*settings["chords"], settings["polish_chord"]):
+        if chord and chord in bindings_original:
             raise ValueError(f"The chord {chord!r} is already bound in your Hyprland bindings.")
 
 
@@ -202,9 +217,10 @@ def atomic_write(path, content, mode=None):
 
 def install_files(source, paths):
     paths.bin_dir.mkdir(parents=True, exist_ok=True)
-    target = paths.bin_dir / SCRIPT
-    shutil.copyfile(source / SCRIPT, target)
-    target.chmod(0o755)
+    for name in (SCRIPT, WRAPPER):
+        target = paths.bin_dir / name
+        shutil.copyfile(source / name, target)
+        target.chmod(0o755)
     for command in COMMANDS.values():
         link = paths.bin_dir / command
         if link.is_symlink() or link.exists():
@@ -216,7 +232,7 @@ def install_files(source, paths):
 
 
 def remove_files(paths):
-    for name in (SCRIPT, *COMMANDS.values()):
+    for name in (SCRIPT, WRAPPER, *COMMANDS.values()):
         (paths.bin_dir / name).unlink(missing_ok=True)
 
 
@@ -235,7 +251,16 @@ def ensure_api_key(path, prompt=getpass.getpass):
 def preflight(paths):
     if os.geteuid() == 0:
         raise RuntimeError("Run as your desktop user, not root or sudo.")
-    for tool in ("voxtype", "curl", "jq", "hyprctl", "systemctl"):
+    for tool in (
+        "voxtype",
+        "curl",
+        "jq",
+        "hyprctl",
+        "systemctl",
+        "wl-paste",
+        "wl-copy",
+        "notify-send",
+    ):
         if shutil.which(tool) is None:
             raise RuntimeError(f"Required command not found: {tool}")
     version = re.search(r"(\d+)\.(\d+)", run("voxtype", "--version"))
@@ -277,7 +302,7 @@ def apply(source, paths, remove=False, prompt=getpass.getpass):
     voxtype_original = paths.voxtype_config.read_text()
     bindings_original = paths.bindings.read_text()
     toml = toml_block(paths.bin_dir, settings["post_process_timeout_ms"])
-    lua = lua_block(settings)
+    lua = lua_block(settings, paths.bin_dir)
     if not remove and TOML_BEGIN not in voxtype_original and LUA_BEGIN not in bindings_original:
         check_conflicts(voxtype_original, bindings_original, settings)
     voxtype_updated = edit_block(voxtype_original, toml, TOML_BEGIN, TOML_END, remove)
@@ -362,7 +387,13 @@ def main():
                 "Set up hold-to-dictate with LLM cleanup?\n"
                 f"  Hold {' or '.join(settings['chords'])} to dictate; the text is cleaned up\n"
                 f"  in the language you spoke. Hold {settings['translate_key']} too for English.\n"
-                "  Dictated text is sent to Cerebras (api.cerebras.ai) and billed to you.\n"
+                + (
+                    f"  Press {settings['polish_chord']} to rewrite clipboard text as English.\n"
+                    if settings["polish_chord"]
+                    else ""
+                )
+                + "  Dictated and clipboard text is sent to Cerebras (api.cerebras.ai),\n"
+                "  billed to you.\n"
                 f"  Managed blocks are appended to {paths.voxtype_config} and {paths.bindings};\n"
                 "  both files are backed up first. Voxtype is restarted and Hyprland reloaded.\n"
                 f"  Change keys or timeouts in {paths.settings} and re-run this installer."

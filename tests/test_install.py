@@ -75,6 +75,12 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('"ALT + SHIFT + F23", "SUPER + SHIFT + F23"', installed_bindings)
         self.assertIn('hl.is_key_down("Shift_R")', installed_bindings)
         self.assertTrue((self.paths.bin_dir / "voxtype-llm").stat().st_mode & 0o111)
+        self.assertTrue((self.paths.bin_dir / "polish-clipboard").stat().st_mode & 0o111)
+        self.assertIn(
+            f'o.bind("SUPER + SHIFT + T", "Polish clipboard text into English", '
+            f'"{self.paths.bin_dir}/polish-clipboard")',
+            installed_bindings,
+        )
         self.assertEqual(os.readlink(self.paths.bin_dir / "voxtype-rephrase"), "voxtype-llm")
         self.assertEqual(os.readlink(self.paths.bin_dir / "voxtype-translate-en"), "voxtype-llm")
         self.assertTrue(self.paths.vocabulary.exists())
@@ -97,6 +103,7 @@ class InstallerTests(unittest.TestCase):
             self.paths.bindings.read_text(), self.bindings_original + "-- later personal edit\n"
         )
         self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
+        self.assertFalse((self.paths.bin_dir / "polish-clipboard").exists())
         self.assertFalse((self.paths.bin_dir / "voxtype-rephrase").is_symlink())
         self.assertFalse((self.paths.state / "installed.json").exists())
         self.assertTrue(self.paths.api_key.exists(), "uninstall keeps the key")
@@ -106,7 +113,7 @@ class InstallerTests(unittest.TestCase):
         self.apply()
         self.paths.settings.parent.mkdir(parents=True)
         self.paths.settings.write_text(
-            json.dumps({"chords": ["SUPER + D"], "translate_key": "Alt_R"})
+            json.dumps({"chords": ["SUPER + D"], "translate_key": "Alt_R", "polish_chord": None})
         )
         self.apply()
         bindings = self.paths.bindings.read_text()
@@ -114,6 +121,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('{ "SUPER + D" }', bindings)
         self.assertNotIn("F23", bindings)
         self.assertIn('hl.is_key_down("Alt_R")', bindings)
+        self.assertNotIn("polish-clipboard", bindings)
 
     def test_refuses_to_shadow_existing_profiles_or_chords(self):
         self.paths.voxtype_config.write_text(
@@ -124,6 +132,9 @@ class InstallerTests(unittest.TestCase):
         self.paths.voxtype_config.write_text(self.voxtype_original)
         self.paths.bindings.write_text('hl.bind("ALT + SHIFT + F23", function() end)\n')
         with self.assertRaisesRegex(ValueError, "already bound"):
+            self.apply()
+        self.paths.bindings.write_text('o.bind("SUPER + SHIFT + T", "Mine", "true")\n')
+        with self.assertRaisesRegex(ValueError, "SUPER \\+ SHIFT \\+ T.*already bound"):
             self.apply()
         self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
 
@@ -146,7 +157,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_edit_block_round_trips_without_trailing_newline(self):
         original = "-- no newline at end"
-        block = install.lua_block(install.DEFAULT_SETTINGS)
+        block = install.lua_block(install.DEFAULT_SETTINGS, Path("/opt/bin"))
         added = install.edit_block(original, block, install.LUA_BEGIN, install.LUA_END)
         self.assertEqual(added, original + block)
         removed = install.edit_block(added, block, install.LUA_BEGIN, install.LUA_END, remove=True)
@@ -162,6 +173,8 @@ class InstallerTests(unittest.TestCase):
             {"translate_key": "Shift_R; os.execute"},
             {"post_process_timeout_ms": "20000"},
             {"post_process_timeout_ms": 10},
+            {"polish_chord": "SUPER + T; rm"},
+            {"polish_chord": ["SUPER + T"]},
             {"unknown": 1},
         ):
             with self.subTest(bad=bad):
@@ -201,6 +214,19 @@ class ScriptTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout, "hello world")
         self.assertIn("no API key", result.stderr)
+        strict = subprocess.run(
+            ["bash", str(script), "--mode", "polish", "--strict"],
+            input="hello world",
+            capture_output=True,
+            text=True,
+            env={
+                "HOME": "/nonexistent",
+                "PATH": "/usr/bin:/bin",
+                "CEREBRAS_API_KEY_FILE": "/nonexistent",
+            },
+        )
+        self.assertEqual((strict.returncode, strict.stdout), (1, ""))
+        subprocess.run(["bash", "-n", str(ROOT / "polish-clipboard")], check=True)
 
     def test_no_secrets_and_no_home_paths_committed(self):
         for path in ROOT.iterdir():
