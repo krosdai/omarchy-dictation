@@ -98,8 +98,10 @@ cleanup before typing the raw text. `polish_chord` is the clipboard key; set it 
 `base_url`, `model` and `reasoning_effort` in the same `settings.json` select the
 LLM. `voxtype-llm` reads them on every call, so changes take effect immediately. Put
 the provider's key in `~/.config/omarchy-dictation/api_key` (mode 0600, one line).
-Re-running the installer validates the settings and prompts for a key if the file is
-missing.
+When you switch providers, replace the key in that file too; otherwise the old key
+is sent to the new provider, which rejects it, and dictation is typed uncleaned.
+Re-running the installer validates the settings but prompts for a key only if the
+file is missing or empty.
 
 | Provider | `base_url` |
 | --- | --- |
@@ -111,7 +113,8 @@ missing.
 
 `model` is any chat model ID the provider lists. Small, fast models suit dictation.
 `reasoning_effort` is sent as-is. Use `null` for models that do not reason or that
-reject the field. Plain `http` is accepted only for localhost. A local server that
+reject the field. Plain `http` is accepted only for localhost, and the URL may not
+carry user info, a query or a fragment. A local server that
 needs no key still needs a non-empty key file; any text will do.
 
 The script first asks for a strict JSON-schema reply. If the server rejects the

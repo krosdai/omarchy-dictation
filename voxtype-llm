@@ -93,11 +93,25 @@ if [ -e "$SETTINGS_FILE" ]; then
 fi
 base_url="${VOXTYPE_LLM_BASE_URL:-$base_url}"
 model="${VOXTYPE_LLM_MODEL:-$model}"
-# Dictated text must not cross the network in the clear.
-case "$base_url" in
-  https://?*|http://localhost|http://localhost[:/]*|http://127.0.0.1|http://127.0.0.1[:/]*|http://\[::1\]*) ;;
-  *) log "base_url must be https (plain http only for localhost): $base_url"; passthrough ;;
-esac
+# Dictated text must not cross the network in the clear. Judge the host curl will
+# actually contact: no user info, query or fragment; scheme and host ignore case.
+url_is_safe() {  # $1 = URL
+  local url="$1" scheme authority host bad='[[:space:]?#\\]'
+  [[ "$url" == *://* && ! "$url" =~ $bad ]] || return 1
+  scheme="${url%%://*}"; authority="${url#*://}"; authority="${authority%%/*}"
+  [[ -n "$authority" && "$authority" != *@* ]] || return 1
+  if [[ "$authority" == \[* ]]; then host="${authority%%]*}]"; else host="${authority%%:*}"; fi
+  host="${host,,}"
+  case "${scheme,,}" in
+    https) [ -n "$host" ] ;;
+    http) [[ "$host" == localhost || "$host" == 127.0.0.1 || "$host" == "[::1]" ]] ;;
+    *) return 1 ;;
+  esac
+}
+if ! url_is_safe "$base_url"; then
+  log "base_url must be https (plain http only for localhost), without user info, query or fragment: $base_url"
+  passthrough
+fi
 ENDPOINT="${base_url%/}/chat/completions"
 
 # ---------------------------------------------------------------- key
@@ -176,10 +190,13 @@ build_body() {  # $1 = "full" | "minimal"
       else {} end)'
 }
 
-# Returns the HTTP status in $status and the body in $response.
+# Returns the HTTP status in $status and the body in $response. All attempts share
+# one time budget so a retry cannot outlast Voxtype's post-processing timeout.
+deadline=$((SECONDS + request_timeout_s))
 call_api() {  # $1 = body
-  local raw
-  raw="$(curl -sS --max-time "$request_timeout_s" -w '\n%{http_code}' \
+  local raw remaining=$((deadline - SECONDS))
+  (( remaining >= 1 )) || { log "time budget of ${request_timeout_s}s used up"; return 1; }
+  raw="$(curl -sS --max-time "$remaining" -w '\n%{http_code}' \
     -H "Authorization: Bearer $key" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json" \

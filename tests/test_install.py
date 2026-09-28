@@ -204,6 +204,10 @@ class InstallerTests(unittest.TestCase):
             {"base_url": "ftp://example.com/v1"},
             {"base_url": "http://api.example.com/v1"},
             {"base_url": "https:///v1"},
+            {"base_url": "https://api.example.com/v1#x"},
+            {"base_url": "https://api.example.com/v1?x=1"},
+            {"base_url": "http://localhost:x@evil.example/v1"},
+            {"base_url": "https://user@api.example.com/v1"},
             {"model": ""},
             {"model": "gpt 5"},
             {"reasoning_effort": "none; rm"},
@@ -258,7 +262,7 @@ class FakeProvider(BaseHTTPRequestHandler):
 
 
 class ScriptTests(unittest.TestCase):
-    def call_provider(self, settings, replies):
+    def call_provider(self, settings, replies, host="127.0.0.1"):
         server = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
         server.requests, server.replies = [], replies
         thread = threading.Thread(target=server.serve_forever)
@@ -268,7 +272,7 @@ class ScriptTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         with tempfile.TemporaryDirectory() as config:
             settings_file = Path(config, "settings.json")
-            base_url = f"http://127.0.0.1:{server.server_port}/v1/"
+            base_url = f"http://{host}:{server.server_port}/v1/"
             settings_file.write_text(json.dumps({"base_url": base_url, **settings}))
             result = subprocess.run(
                 ["bash", str(ROOT / "voxtype-llm"), "--mode", "translate"],
@@ -295,7 +299,10 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(body["reasoning_effort"], "none")
         self.assertIn("response_format", body)
 
-        result, requests = self.call_provider({"reasoning_effort": None}, [(200, answer)])
+        result, requests = self.call_provider(
+            {"reasoning_effort": None}, [(200, answer)], host="LOCALHOST"
+        )
+        self.assertEqual(result.stdout, "Hello")
         self.assertEqual(requests[0][2]["model"], install.DEFAULT_SETTINGS["model"])
         self.assertNotIn("reasoning_effort", requests[0][2])
 
@@ -316,25 +323,31 @@ class ScriptTests(unittest.TestCase):
         self.assertIn(f'DEFAULT_MODEL="{defaults["model"]}"', script)
         self.assertIn(f'DEFAULT_REASONING_EFFORT="{defaults["reasoning_effort"]}"', script)
 
-    def test_remote_plain_http_is_refused(self):
-        with tempfile.TemporaryDirectory() as config:
-            settings_file = Path(config, "settings.json")
-            settings_file.write_text(json.dumps({"base_url": "http://api.example.com/v1"}))
-            result = subprocess.run(
-                ["bash", str(ROOT / "voxtype-llm"), "--mode", "rephrase"],
-                input="hello world",
-                capture_output=True,
-                text=True,
-                env={
-                    "HOME": "/nonexistent",
-                    "PATH": "/usr/bin:/bin",
-                    "VOXTYPE_LLM_API_KEY": "test-key",
-                    "VOXTYPE_LLM_SETTINGS_FILE": str(settings_file),
-                },
-                check=True,
-            )
-        self.assertEqual(result.stdout, "hello world")
-        self.assertIn("base_url must be https", result.stderr)
+    def test_unsafe_base_urls_are_refused(self):
+        for url in (
+            "http://api.example.com/v1",
+            "http://localhost:x@evil.example/v1",
+            "http://localhost@evil.example",
+            "https://api.example.com/v1#x",
+            "https://api.example.com/v1?x=1",
+            "ftp://api.example.com/v1",
+        ):
+            with self.subTest(url=url):
+                result = subprocess.run(
+                    ["bash", str(ROOT / "voxtype-llm"), "--mode", "rephrase"],
+                    input="hello world",
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "HOME": "/nonexistent",
+                        "PATH": "/usr/bin:/bin",
+                        "VOXTYPE_LLM_API_KEY": "test-key",
+                        "VOXTYPE_LLM_BASE_URL": url,
+                    },
+                    check=True,
+                )
+                self.assertEqual(result.stdout, "hello world")
+                self.assertIn("base_url must be https", result.stderr)
 
     def test_script_parses_and_passes_input_through_without_key(self):
         script = ROOT / "voxtype-llm"

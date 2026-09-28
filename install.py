@@ -113,7 +113,14 @@ def load_settings(path):
         raise ValueError("settings.polish_chord must be a Hyprland chord or null")
     base_url = settings["base_url"]
     url = urllib.parse.urlsplit(base_url) if isinstance(base_url, str) else None
-    if not url or url.scheme not in {"https", "http"} or not url.hostname or url.query:
+    # Mirror voxtype-llm's runtime check: no user info, query or fragment.
+    if (
+        not url
+        or url.scheme not in {"https", "http"}
+        or not url.hostname
+        or "@" in url.netloc
+        or re.search(r"[\s?#\\]", base_url)
+    ):
         raise ValueError(
             "settings.base_url must be an http(s) URL such as https://api.openai.com/v1"
         )
