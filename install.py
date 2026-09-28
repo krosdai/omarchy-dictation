@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -283,17 +284,32 @@ def restart_services():
     check_errors()
 
 
-def verify_profiles():
-    probe = subprocess.run(
-        ["voxtype", "record", "start", "--profile", f"__{ID}_probe__"],
-        capture_output=True,
-        text=True,
-    )
-    listed = re.search(r"Available profiles:\s*(.*)", probe.stderr + probe.stdout)
+def verify_profiles(timeout_s=30):
+    """Ask Voxtype which profiles it knows.
+
+    The CLI answers from the daemon, which takes a few seconds to come back after a
+    restart and reports "daemon is not running" meanwhile, so keep probing until it
+    lists profiles, says there are none, or the time is up.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        probe = subprocess.run(
+            ["voxtype", "record", "start", "--profile", f"__{ID}_probe__"],
+            capture_output=True,
+            text=True,
+        )
+        output = probe.stderr + probe.stdout
+        listed = re.search(r"Available profiles:\s*(.*)", output)
+        if listed or "No profiles are configured" in output or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     available = {name.strip() for name in listed.group(1).split(",")} if listed else set()
     missing = set(PROFILES) - available
     if missing:
-        raise RuntimeError(f"Voxtype does not list the profiles {sorted(missing)} after restart.")
+        detail = output.strip().splitlines()[0] if output.strip() else "no output"
+        raise RuntimeError(
+            f"Voxtype does not list the profiles {sorted(missing)} after restart ({detail})."
+        )
 
 
 # ----------------------------------------------------------------- apply

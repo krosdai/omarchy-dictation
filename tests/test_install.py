@@ -138,6 +138,28 @@ class InstallerTests(unittest.TestCase):
             self.apply()
         self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
 
+    def test_verification_waits_for_the_daemon_to_come_back(self):
+        answers = iter(
+            [
+                "Error: Voxtype daemon is not running (stale PID file removed).\n",
+                "Error: Voxtype daemon is not running.\n",
+                PROBE_OUTPUT,
+            ]
+        )
+
+        def slow_probe(args, **kwargs):
+            self.system.commands.append(tuple(args))
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr=next(answers))
+
+        with (
+            patch.object(install, "run", side_effect=self.system.run),
+            patch.object(install.subprocess, "run", side_effect=slow_probe),
+            patch.object(install.time, "sleep") as sleep,
+        ):
+            install.apply(ROOT, self.paths, prompt=lambda _: "csk-test-key")
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue((self.paths.state / "installed.json").exists())
+
     def test_failed_verification_rolls_everything_back(self):
         def bad_probe(args, **kwargs):
             return subprocess.CompletedProcess(
@@ -147,6 +169,7 @@ class InstallerTests(unittest.TestCase):
         with (
             patch.object(install, "run", side_effect=self.system.run),
             patch.object(install.subprocess, "run", side_effect=bad_probe),
+            patch.object(install.time, "sleep"),
             self.assertRaisesRegex(RuntimeError, "does not list the profiles"),
         ):
             install.apply(ROOT, self.paths, prompt=lambda _: "csk-test-key")
