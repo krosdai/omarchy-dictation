@@ -87,14 +87,15 @@ if [ -e "$SETTINGS_FILE" ]; then
       def line: type == "string" and (test("[\n\r]") | not);
       if type != "object" then error("not an object") else . end
       | [ pick("base_url"; $url), pick("model"; $model), pick("reasoning_effort"; $effort) ]
-      | if (.[0] | line) and (.[1] | line) and (.[2] == null or (.[2] | line))
+      | if (.[0] | line and length > 0) and (.[1] | line and length > 0)
+          and (.[2] == null or (.[2] | line))
         then map(. // "") | join("\n") else error("invalid provider setting") end
       ' "$SETTINGS_FILE" 2>/dev/null)"; then
     log "cannot read $SETTINGS_FILE; passing text through"
     passthrough
   fi
   mapfile -t fields <<<"$provider"
-  base_url="${fields[0]}"; model="${fields[1]}"; reasoning_effort="${fields[2]:-}"
+  base_url="${fields[0]:-}"; model="${fields[1]:-}"; reasoning_effort="${fields[2]:-}"
 fi
 base_url="${VOXTYPE_LLM_BASE_URL:-$base_url}"
 model="${VOXTYPE_LLM_MODEL:-$model}"

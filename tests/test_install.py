@@ -312,7 +312,13 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", requests[0][2])
 
     def test_explicit_invalid_settings_fail_closed(self):
-        for settings in ({"base_url": None}, {"model": False}, {"reasoning_effort": 1}):
+        for settings in (
+            {"base_url": None},
+            {"model": False},
+            {"model": "", "reasoning_effort": None},
+            {"base_url": ""},
+            {"reasoning_effort": 1},
+        ):
             with self.subTest(settings=settings), tempfile.TemporaryDirectory() as config:
                 settings_file = Path(config, "settings.json")
                 settings_file.write_text(json.dumps(settings))
