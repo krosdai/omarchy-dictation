@@ -208,6 +208,8 @@ class InstallerTests(unittest.TestCase):
             {"base_url": "https://api.example.com/v1?x=1"},
             {"base_url": "http://localhost:x@evil.example/v1"},
             {"base_url": "https://user@api.example.com/v1"},
+            {"base_url": "https://api.example.com:notaport/v1"},
+            {"base_url": "https://api.example.com:99999/v1"},
             {"model": ""},
             {"model": "gpt 5"},
             {"reasoning_effort": "none; rm"},
@@ -284,6 +286,9 @@ class ScriptTests(unittest.TestCase):
                     "PATH": "/usr/bin:/bin",
                     "VOXTYPE_LLM_API_KEY": "test-key",
                     "VOXTYPE_LLM_SETTINGS_FILE": str(settings_file),
+                    # A dead proxy: local providers must be reached directly.
+                    "http_proxy": "http://127.0.0.1:9",
+                    "ALL_PROXY": "http://127.0.0.1:9",
                 },
                 check=True,
             )
@@ -305,6 +310,27 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.stdout, "Hello")
         self.assertEqual(requests[0][2]["model"], install.DEFAULT_SETTINGS["model"])
         self.assertNotIn("reasoning_effort", requests[0][2])
+
+    def test_explicit_invalid_settings_fail_closed(self):
+        for settings in ({"base_url": None}, {"model": False}, {"reasoning_effort": 1}):
+            with self.subTest(settings=settings), tempfile.TemporaryDirectory() as config:
+                settings_file = Path(config, "settings.json")
+                settings_file.write_text(json.dumps(settings))
+                result = subprocess.run(
+                    ["bash", str(ROOT / "voxtype-llm"), "--mode", "rephrase"],
+                    input="hello world",
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "HOME": "/nonexistent",
+                        "PATH": "/usr/bin:/bin",
+                        "VOXTYPE_LLM_API_KEY": "test-key",
+                        "VOXTYPE_LLM_SETTINGS_FILE": str(settings_file),
+                    },
+                    check=True,
+                )
+                self.assertEqual(result.stdout, "hello world")
+                self.assertIn("cannot read", result.stderr)
 
     def test_rejected_request_is_retried_without_optional_fields(self):
         answer = {"choices": [{"message": {"content": '{"text": "Hello"}'}}]}

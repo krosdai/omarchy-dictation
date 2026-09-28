@@ -77,14 +77,19 @@ passthrough() {
 }
 
 # ---------------------------------------------------------------- provider
-# A null reasoning_effort omits the field for providers that reject it.
+# A null reasoning_effort omits the field for providers that reject it. Any other
+# explicit value of the wrong type fails closed rather than falling back to the
+# default provider, which would receive another provider's key.
 base_url="$DEFAULT_BASE_URL"; model="$DEFAULT_MODEL"; reasoning_effort="$DEFAULT_REASONING_EFFORT"
 if [ -e "$SETTINGS_FILE" ]; then
   if ! provider="$(jq -er --arg url "$base_url" --arg model "$model" --arg effort "$reasoning_effort" '
+      def pick($k; $d): if has($k) then .[$k] else $d end;
+      def line: type == "string" and (test("[\n\r]") | not);
       if type != "object" then error("not an object") else . end
-      | [ (.base_url // $url), (.model // $model),
-          (if has("reasoning_effort") then (.reasoning_effort // "") else $effort end) ]
-      | map(tostring) | join("\n")' "$SETTINGS_FILE" 2>/dev/null)"; then
+      | [ pick("base_url"; $url), pick("model"; $model), pick("reasoning_effort"; $effort) ]
+      | if (.[0] | line) and (.[1] | line) and (.[2] == null or (.[2] | line))
+        then map(. // "") | join("\n") else error("invalid provider setting") end
+      ' "$SETTINGS_FILE" 2>/dev/null)"; then
     log "cannot read $SETTINGS_FILE; passing text through"
     passthrough
   fi
@@ -112,6 +117,9 @@ if ! url_is_safe "$base_url"; then
   log "base_url must be https (plain http only for localhost), without user info, query or fragment: $base_url"
   passthrough
 fi
+# A loopback server must be reached directly, never through an http_proxy.
+curl_local=()
+[[ "${base_url,,}" == http://* ]] && curl_local=(--noproxy '*')
 ENDPOINT="${base_url%/}/chat/completions"
 
 # ---------------------------------------------------------------- key
@@ -196,7 +204,8 @@ deadline=$((SECONDS + request_timeout_s))
 call_api() {  # $1 = body
   local raw remaining=$((deadline - SECONDS))
   (( remaining >= 1 )) || { log "time budget of ${request_timeout_s}s used up"; return 1; }
-  raw="$(curl -sS --max-time "$remaining" -w '\n%{http_code}' \
+  # --globoff: braces or brackets in the URL must not fan out into several requests.
+  raw="$(curl -sS --globoff "${curl_local[@]}" --max-time "$remaining" -w '\n%{http_code}' \
     -H "Authorization: Bearer $key" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json" \

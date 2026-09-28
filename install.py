@@ -112,7 +112,11 @@ def load_settings(path):
     if polish is not None and not _is_chord(polish):
         raise ValueError("settings.polish_chord must be a Hyprland chord or null")
     base_url = settings["base_url"]
-    url = urllib.parse.urlsplit(base_url) if isinstance(base_url, str) else None
+    try:
+        url = urllib.parse.urlsplit(base_url) if isinstance(base_url, str) else None
+        url and url.port  # raises ValueError for a malformed or out-of-range port
+    except ValueError:
+        url = None
     # Mirror voxtype-llm's runtime check: no user info, query or fragment.
     if (
         not url
