@@ -1,191 +1,213 @@
-# Omarchy Dictation Cleanup
+# Omarchy Voice Input
 
-Hold a key, speak, release: Voxtype transcribes, an LLM tidies the text, and the
-result is typed at your cursor. A second key does the same for text you wrote:
-copy it, press the key, paste it back as native English.
+Standalone hold-to-dictate for Omarchy. PipeWire captures your microphone,
+ElevenLabs Scribe v2 Realtime transcribes it, and an OpenAI-compatible text model
+cleans up the result before it is typed at your cursor. **Voxtype is not required.**
 
-- **Hold the dictation key:** Whisper transcribes in whatever language you spoke.
-  The transcript is rewritten as clean prose in that same language: fillers, false
-  starts and punctuation fixed, nothing translated.
-- **Hold Right Shift as well:** the same transcript is rendered as native English.
-- **Release:** recording stops and Voxtype types the result, with its usual
-  clipboard fallback.
-- **Press Super + Shift + T:** the text in the clipboard, in any language and with
-  any Markdown formatting, is rewritten as native English with the same paragraphs,
-  headings, lists, links and code blocks, and put back in the clipboard. A
-  notification shows progress and a preview; the clipboard is left untouched if
-  the rewrite fails.
+- Hold the dictation key to speak; release it to finish and insert the result.
+- Keep the spoken language, or hold Right Shift to render this utterance as English.
+- A passive, click-through Quickshell HUD shows the microphone waveform and live
+  subtitles without stealing keyboard focus. Interim subtitles can be revised;
+  only committed recognition results are used for final output.
+- Click the microphone bar widget to open settings: default mode, microphone,
+  a local microphone test, text provider, model, and credential setup.
+- Copy a draft, press Super + Shift + T, then paste: clipboard polishing rewrites
+  it as natural English while preserving Markdown structure.
+- Vocabulary correction uses your preferred spellings during text cleanup.
 
-Cleanup works with any OpenAI-compatible Chat Completions API: OpenAI, Groq,
-OpenRouter, a local Ollama or vLLM server, and so on. The default is Cerebras
-(`qwen-3.8-27b`), which adds roughly 150 to 250 ms after transcription; see
-[Choose the provider](#choose-the-provider). If the API is unreachable, slow, or
-returns anything unusable, the raw transcription is typed instead. Dictation never
-silently fails; at worst it is not cleaned up.
-
-The default key is the Copilot key found on recent laptops, which Hyprland sees as
-Shift + Meta + F23. See [Change the keys](#change-the-keys) for anything else.
+Voice conversation and TTS are **not implemented yet**. The settings panel marks
+them as unavailable; no synthetic waveform or pretend AI reply is shown.
 
 ## Requirements
 
-- Omarchy with Lua-based Hyprland configuration and a running Hyprland session.
-- Voxtype 1.1 or later with the Whisper engine and profile support. The Vulkan
-  build shipped with Omarchy works. `whisper.language = "auto"` is recommended so
-  the same key works for every language you speak.
-- `curl`, `jq` 1.7 or later, `wl-clipboard` and `notify-send`. All ship with Omarchy.
-- An API key for your provider (by default Cerebras, from <https://cloud.cerebras.ai/>).
-  Each dictation is one chat completion billed to that account, and the dictated
-  text leaves your machine unless the server is local.
+- Omarchy with Quickshell and Lua-based Hyprland configuration (developed against
+  Omarchy 4.0.4, Quickshell 0.3.1 and Qt 6.11).
+- Python 3.11+ with venv/pip. Setup provisions a private venv with
+  `websockets==15.0.1`; it does not modify system Python packages.
+- PipeWire tools: `pw-record`, `pw-dump`, `wpctl`.
+- `wtype`, `wl-copy`, `wl-paste`, `curl`, `jq` 1.7+, and `notify-send`.
+- An ElevenLabs API key with Scribe Realtime access, plus a key for your text
+  provider (Cerebras by default).
+
+Audio is uploaded to ElevenLabs. Dictated and clipboard text goes to your selected
+text provider, unless it is local. Both services may bill your account. The
+microphone test only reads local PCM and never connects to either provider.
 
 ## Install
 
-Review this repository, then add and enable the plugin:
+After this version is published, review the code and add its GitHub source:
 
 ```sh
 omarchy plugin add https://github.com/krosdai/omarchy-dictation.git --enable
 ```
 
-The first enable opens a terminal that explains what will change and asks for
-confirmation, then for your API key (input hidden). The installer:
+For an unpublished build, copy the plugin files into a new
+`~/.config/omarchy/plugins/krosdai.dictation/` directory, rescan with
+`omarchy-shell shell rescanPlugins`, then enable with
+`omarchy plugin enable krosdai.dictation`. Do not overwrite an existing plugin;
+use the isolated development checks below until you are ready to migrate.
+`plugin add` clones Git history and does not include uncommitted local edits.
 
-1. Copies `voxtype-llm`, its two command names and `polish-clipboard` into
-   `~/.local/bin`.
-2. Appends a managed block with `[profiles.rephrase]` and `[profiles.translate]` to
-   `~/.config/voxtype/config.toml`.
-3. Appends a managed block with the dictation and clipboard key bindings to
-   `~/.config/hypr/bindings.lua`.
-4. Creates `~/.config/voxtype/vocabulary.txt` from the example if you have none.
-5. Stores the key in `~/.config/omarchy-dictation/api_key` with owner-only permissions.
-6. Restarts Voxtype, reloads Hyprland, checks for configuration errors and confirms
-   both profiles are available. If anything fails, every change is reverted.
+Enabling starts the plugin service and, if setup is needed, opens a terminal asking
+for confirmation. Setup creates private credentials, a Python runtime and command
+launchers, then backs up and adds managed bindings to `~/.config/hypr/bindings.lua`.
+It reloads Hyprland and checks for configuration errors. A failed reload restores
+the previous bindings and launchers. Credentials and the runtime are retained.
+Setup refuses to overwrite a personal command or a modified plugin launcher;
+move the conflicting command yourself before retrying.
 
-Both configuration files are backed up under `~/.local/state/omarchy-dictation/`
-first. The installer refuses to run if either profile name or any of the chords is
-already configured by hand; remove those first.
-
-You can also run it directly:
+The default dictation key is the Copilot key (`F23`); modifier spellings are included
+for different keyboard layouts. If you use another key, edit the settings below.
+The bar widget is optional; use Omarchy's bar customization to add
+`krosdai.dictation`. Settings can also be opened through shell IPC:
 
 ```sh
-/usr/bin/python ~/.config/omarchy/plugins/krosdai.dictation/install.py
+omarchy-shell dictation open
 ```
 
-## Change the keys
+To run setup directly, use the `install.py` in your registered checkout:
 
-Create `~/.config/omarchy-dictation/settings.json`, then re-run the installer. It
-replaces its managed blocks with the new values.
+```sh
+/usr/bin/python /absolute/path/to/omarchy-dictation/install.py
+```
+
+### Upgrading from the Voxtype-based version
+
+Setup removes this plugin's old managed TOML profiles and unchanged legacy commands,
+and copies your old Voxtype vocabulary if the new vocabulary does not exist.
+Modified legacy scripts and unproven symlinks are preserved. It does **not** stop,
+uninstall or reconfigure Voxtype beyond those owned profiles. Disable any legacy
+dictation service or remove overlapping personal hotkeys before using the new
+plugin; two recorders must not own the same key. The installer never starts or
+queries Voxtype.
+
+## Settings and credentials
+
+Files live in `~/.config/omarchy-dictation/` (or your `XDG_CONFIG_HOME`):
+
+| File | Purpose |
+| --- | --- |
+| `settings.json` | Mode, microphone, keys, timeout and text provider |
+| `elevenlabs_api_key` | Recognition key; owner-only permissions |
+| `api_key` | Text-provider key; owner-only permissions |
+| `vocabulary.txt` | Preferred spellings, one term per line |
+
+The settings panel saves mode, microphone and provider options. Key changes require
+editing the file and re-running setup, which replaces only its managed bindings.
 
 ```json
 {
   "chords": ["SUPER + D"],
   "translate_key": "Shift_R",
-  "post_process_timeout_ms": 20000,
   "polish_chord": "SUPER + SHIFT + T",
+  "post_process_timeout_ms": 20000,
+  "mode": "rephrase",
+  "microphone": "auto",
   "base_url": "https://api.cerebras.ai/v1",
   "model": "qwen-3.8-27b",
   "reasoning_effort": "none"
 }
 ```
 
-`chords` are Hyprland bind chords; several are allowed, and the default lists two
-spellings of the Copilot key because Omarchy's default layout exposes the left Meta
-key as Alt. `translate_key` is an XKB key name checked with `hl.is_key_down` while
-the chord is pressed. `post_process_timeout_ms` is how long Voxtype waits for the
-cleanup before typing the raw text. `polish_chord` is the clipboard key; set it to
-`null` to leave the clipboard feature out.
+`mode` is `rephrase` or `translate`. `microphone` is `auto`, a PipeWire input node
+name or an object serial. The panel lists available input nodes. A muted microphone
+is rejected; the plugin never unmutes it for you. Release handling ignores modifier
+changes while the key is held. Escape cancels an active operation and is also passed
+to the focused application; it does nothing to the plugin when idle.
 
-## Choose the provider
+Provider and model changes apply to the next operation. **When changing providers,
+update the key too**: otherwise the existing key is sent to the new endpoint.
+Use the panel's secure-terminal button or:
 
-`base_url`, `model` and `reasoning_effort` in the same `settings.json` select the
-LLM. `voxtype-llm` reads them on every call, so changes take effect immediately. Put
-the provider's key in `~/.config/omarchy-dictation/api_key` (mode 0600, one line).
-When you switch providers, replace the key in that file too; otherwise the old key
-is sent to the new provider, which rejects it, and dictation is typed uncleaned.
-Re-running the installer validates the settings but prompts for a key only if the
-file is missing or empty.
+```sh
+/usr/bin/python /absolute/path/to/omarchy-dictation/install.py --credentials
+```
+
+Any OpenAI-compatible Chat Completions endpoint can be used. Examples:
 
 | Provider | `base_url` |
 | --- | --- |
-| Cerebras (default) | `https://api.cerebras.ai/v1` |
+| Cerebras | `https://api.cerebras.ai/v1` |
 | OpenAI | `https://api.openai.com/v1` |
 | Groq | `https://api.groq.com/openai/v1` |
 | OpenRouter | `https://openrouter.ai/api/v1` |
-| Ollama (local) | `http://localhost:11434/v1` |
+| Ollama | `http://localhost:11434/v1` |
 
-`model` is any chat model ID the provider lists. Small, fast models suit dictation.
-`reasoning_effort` is sent as-is. Use `null` for models that do not reason or that
-reject the field. Plain `http` is accepted only for localhost, and the URL may not
-carry user info, a query or a fragment. A local server that
-needs no key still needs a non-empty key file; any text will do.
+Select a model available to your account. Set `reasoning_effort` to `null` to omit
+it. Plain HTTP is accepted only for localhost; credentials, query strings and
+fragments are rejected in the URL. A keyless local endpoint still requires a
+nonempty key file; any placeholder will do. Servers rejecting structured-output
+options with HTTP 400/422 are retried once without optional request fields.
 
-The script first asks for a strict JSON-schema reply. If the server rejects the
-request (HTTP 400 or 422), it retries once with only the model, messages and token
-limit. This works with servers that lack structured outputs, `temperature` or
-`reasoning_effort`, at the cost of an extra round trip. Set `reasoning_effort` to
-`null` if the log shows the retry on every dictation.
+Vocabulary edits apply immediately during cleanup, not during audio recognition.
+The waveform is measured from the actual captured PCM; display gain does not
+change the audio sent to the recognizer.
 
-## Vocabulary
+## Failure behavior and privacy
 
-`~/.config/voxtype/vocabulary.txt` lists one name or term per line. They are passed
-to the model as spellings to prefer whenever the transcript contains something that
-sounds like them, so `vox type` becomes `Voxtype`. The file is read on every
-dictation; edits take effect immediately.
+- Recognition failure, timeout or cancellation never inserts a partial transcript.
+- Cleanup failure falls back to the **complete committed** original transcript,
+  with a visible warning. Translation failure can therefore insert the original
+  language, not English.
+- If an empty `wtype` capability probe fails, the result is copied for manual paste.
+  Failure after typing starts never retries or copies automatically: insertion may
+  already be partial, and retrying could duplicate it.
+- Clipboard-polish failure leaves the clipboard unchanged.
+- Disabling/unloading the service closes its command stream, stops capture and
+  reaps its child processes. Text delivery already in progress finishes within
+  its timeout rather than being interrupted. Hotkey launchers remain until uninstall.
+- Audio is streamed, not saved locally. Transcripts remain in memory/UI, not in
+  a local history file. Provider-side retention is controlled by your providers.
+- Keys never enter QML, IPC messages or command arguments. Cleanup treats dictated
+  text as data and validates the structured reply; model wording is not guaranteed.
 
-This fixes spelling after recognition. If Whisper cannot hear a term at all, add the
-same list to `whisper.initial_prompt` in the Voxtype config too; that biases
-recognition itself and needs `systemctl --user restart voxtype`.
-
-## Verify
+The backend has one private Unix socket under
+`$XDG_RUNTIME_DIR/omarchy-dictation/`. Multiple service instances cannot record
+concurrently. For troubleshooting, inspect the Quickshell log and:
 
 ```sh
-hyprctl binds | grep -B2 -A3 F23           # press and release binds for each chord
-voxtype record start --profile __probe__   # "Available profiles: rephrase, translate"
-printf 'so um i think we should, we should move it to thursday' | voxtype-rephrase
-printf '这个功能挺好用的然后我们下周搞定' | voxtype-translate-en
-printf '## 今天\n\n- 把 clipboard 功能做完了' | voxtype-llm --mode polish
-printf 'some draft' | wl-copy && polish-clipboard && wl-paste
+omarchy-dictation status
+omarchy-dictation test       # local-only microphone test; run again to stop
+omarchy-dictation cancel
+printf 'so um we should move it to thursday' | dictation-llm --mode rephrase
+printf '这个功能下周完成' | dictation-llm --mode translate
 ```
 
-The last four commands call the API. Logs: `journalctl --user -u voxtype`; the
-script reports failures on stderr, prefixed `voxtype-llm:`, and `polish-clipboard`
-shows them as notifications.
-
-## Security notes
-
-Dictated and clipboard text is untrusted input to the model. The script sends it
-wrapped in `<transcript>` (or `<draft>`) tags with instructions to treat it as data,
-neutralises tag-like text inside it, requires a strict JSON reply (`{"text": ...}`)
-through the API's `response_format`, and rejects replies that are empty, leak the
-delimiter, or grow far beyond the input. Phrases such as "ignore previous
-instructions" come back rewritten, not obeyed. This is defence in depth, not a
-guarantee; the model still chooses the wording. Whatever is in the clipboard when
-you press the polish key is sent to the API, so check it first.
-
-The key is read from a mode-0600 file and never passed on a command line. For
-manual use, the script also honours `VOXTYPE_LLM_API_KEY`, `VOXTYPE_LLM_API_KEY_FILE`,
-`VOXTYPE_LLM_BASE_URL`, `VOXTYPE_LLM_MODEL`, `VOXTYPE_LLM_SETTINGS_FILE` and
-`VOXTYPE_VOCABULARY_FILE`. The systemd user session does not inherit shell
-variables, so the files are the default.
+The last two commands contact the configured text provider. Manual script use
+supports `DICTATION_LLM_API_KEY`, `DICTATION_LLM_API_KEY_FILE`,
+`DICTATION_LLM_BASE_URL`, `DICTATION_LLM_MODEL`, `DICTATION_LLM_SETTINGS_FILE` and
+`DICTATION_VOCABULARY_FILE`. Normal plugin use takes configuration from its files.
 
 ## Remove
 
-Disable the plugin, then remove its configuration explicitly:
-
 ```sh
 omarchy plugin disable krosdai.dictation
-/usr/bin/python ~/.config/omarchy/plugins/krosdai.dictation/install.py --uninstall
+/usr/bin/python /absolute/path/to/omarchy-dictation/install.py --uninstall
 ```
 
-This deletes the managed blocks and the four commands, restarts Voxtype and
-reloads Hyprland. Your other configuration, the API key and the vocabulary file are
-left in place. Disabling alone stops the launcher but changes nothing else.
+Uninstall removes owned bindings and unchanged command launchers, then reloads
+Hyprland. Personal edits, settings, keys, vocabulary, runtime and backups remain.
 
-## Develop
+## Develop and verify
 
 ```sh
-python -m unittest discover -s tests -v
+python -m venv .venv
+.venv/bin/pip install websockets==15.0.1 ruff
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/ruff check .
 omarchy plugin validate .
 ```
 
-Tests exercise the installer against temporary directories with the system calls
-faked, and the script's syntax and fallback path; nothing touches the desktop or the
-API.
+Tests use temporary configuration, fake desktop tools and local WebSocket/HTTP
+servers. They do not record your microphone, change desktop settings or contact
+cloud providers. `tests/render_ui.py` additionally renders actual QML states and
+the production service in an isolated Wayland compositor:
+
+```sh
+XDG_RUNTIME_DIR=/path/to/private/runtime WAYLAND_DISPLAY=wayland-1 \
+  .venv/bin/python tests/render_ui.py --artifacts /path/to/screenshots
+```
+
+Run that only against a disposable headless compositor with `grim` and `wtype`;
+it deliberately sends an Escape key to that isolated session. A final real-device
+and provider acceptance test is still needed before treating a build as released.

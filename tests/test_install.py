@@ -1,5 +1,6 @@
-"""Installer and script checks that run without Voxtype, Hyprland or the API."""
+"""Installer checks with a mocked desktop and local-only fake text providers."""
 
+import io
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -17,11 +19,9 @@ sys.path.insert(0, str(ROOT))
 
 import install  # noqa: E402
 
-PROBE_OUTPUT = "Error: Profile '__x__' not found.\n\nAvailable profiles: rephrase, translate\n"
-
 
 class FakeSystem:
-    """Stands in for subprocess calls; records them and answers the probe."""
+    """Records system and pip commands without executing any of them."""
 
     def __init__(self):
         self.commands = []
@@ -29,10 +29,6 @@ class FakeSystem:
     def run(self, *args, **kwargs):
         self.commands.append(args)
         return ""
-
-    def probe(self, args, **kwargs):
-        self.commands.append(tuple(args))
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr=PROBE_OUTPUT)
 
 
 class InstallerTests(unittest.TestCase):
@@ -44,11 +40,19 @@ class InstallerTests(unittest.TestCase):
             voxtype_config=root / "voxtype/config.toml",
             bindings=root / "hypr/bindings.lua",
             settings=root / "omarchy-dictation/settings.json",
-            vocabulary=root / "voxtype/vocabulary.txt",
+            vocabulary=root / "omarchy-dictation/vocabulary.txt",
             api_key=root / "omarchy-dictation/api_key",
             bin_dir=root / "bin",
             state=root / "state",
+            elevenlabs_api_key=root / "omarchy-dictation/elevenlabs_api_key",
+            runtime=root / "data/venv/bin/python",
         )
+        # Keep installer tests independent of the parallel backend implementation.
+        self.source = root / "plugin checkout's files"
+        self.source.mkdir()
+        for name in (install.SCRIPT, install.WRAPPER, "vocabulary.example.txt"):
+            shutil.copyfile(ROOT / name, self.source / name)
+        (self.source / "voice.py").write_text("# fake standalone backend\n")
         self.voxtype_original = '[whisper]\nmodel = "large-v3"\nlanguage = "auto"\n'
         self.bindings_original = (
             'hl.bind("SUPER + RETURN", function() hl.exec_cmd("ghostty") end)\n'
@@ -60,38 +64,55 @@ class InstallerTests(unittest.TestCase):
         self.system = FakeSystem()
 
     def apply(self, **kwargs):
-        with (
-            patch.object(install, "run", side_effect=self.system.run),
-            patch.object(install.subprocess, "run", side_effect=self.system.probe),
-        ):
-            install.apply(ROOT, self.paths, prompt=lambda _: "csk-test-key", **kwargs)
+        with patch.object(install, "run", side_effect=self.system.run):
+            install.apply(self.source, self.paths, prompt=lambda _: "test-key", **kwargs)
 
     def test_install_is_idempotent_and_uninstall_preserves_edits(self):
         self.apply()
         installed_voxtype = self.paths.voxtype_config.read_text()
         installed_bindings = self.paths.bindings.read_text()
-        self.assertTrue(installed_voxtype.startswith(self.voxtype_original))
-        self.assertIn("[profiles.rephrase]", installed_voxtype)
-        self.assertIn("[profiles.translate]", installed_voxtype)
-        self.assertIn(f'"{self.paths.bin_dir}/voxtype-translate-en"', installed_voxtype)
-        self.assertIn('"ALT + SHIFT + F23", "SUPER + SHIFT + F23"', installed_bindings)
+        self.assertEqual(installed_voxtype, self.voxtype_original)
+        for chord in install.DEFAULT_SETTINGS["chords"]:
+            self.assertIn(json.dumps(chord), installed_bindings)
         self.assertIn('hl.is_key_down("Shift_R")', installed_bindings)
-        self.assertTrue((self.paths.bin_dir / "voxtype-llm").stat().st_mode & 0o111)
+        self.assertIn("start --mode translate", installed_bindings)
+        self.assertIn("omarchy-dictation stop", installed_bindings)
+        self.assertIn("omarchy-dictation cancel", installed_bindings)
+        self.assertIn("ignore_mods = true", installed_bindings)
+        self.assertIn("non_consuming = true", installed_bindings)
+        self.assertNotIn("dictation_recording", installed_bindings)
+        self.assertNotIn("voxtype", installed_bindings)
+        self.assertTrue((self.paths.bin_dir / "dictation-llm").stat().st_mode & 0o111)
         self.assertTrue((self.paths.bin_dir / "polish-clipboard").stat().st_mode & 0o111)
         self.assertIn(
             f'o.bind("SUPER + SHIFT + T", "Polish clipboard text into English", '
             f'"{self.paths.bin_dir}/polish-clipboard")',
             installed_bindings,
         )
-        self.assertEqual(os.readlink(self.paths.bin_dir / "voxtype-rephrase"), "voxtype-llm")
-        self.assertEqual(os.readlink(self.paths.bin_dir / "voxtype-translate-en"), "voxtype-llm")
+        for name in install.COMMANDS:
+            self.assertFalse((self.paths.bin_dir / name).is_symlink())
+            subprocess.run(["sh", "-n", str(self.paths.bin_dir / name)], check=True)
+        launcher = (self.paths.bin_dir / install.LAUNCHER).read_text()
+        self.assertIn(str(self.paths.runtime), launcher)
+        self.assertIn("voice.py", launcher)
+        self.assertIn("'\"'\"'", launcher, "checkout paths must be shell quoted")
         self.assertTrue(self.paths.vocabulary.exists())
-        self.assertEqual(self.paths.api_key.read_text(), "csk-test-key\n")
+        self.assertEqual(self.paths.api_key.read_text(), "test-key\n")
         self.assertEqual(self.paths.api_key.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.paths.elevenlabs_api_key.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(install.load_settings(self.paths.settings), install.DEFAULT_SETTINGS)
         marker = json.loads((self.paths.state / "installed.json").read_text())
         self.assertEqual(marker["version"], install.VERSION)
         self.assertEqual(Path(marker["backup"], "config.toml").read_text(), self.voxtype_original)
-        self.assertIn(("systemctl", "--user", "restart", "voxtype.service"), self.system.commands)
+        self.assertFalse(any("systemctl" in c or "voxtype" in c for c in self.system.commands))
+        self.assertIn(
+            ("/usr/bin/python", "-m", "venv", str(self.paths.runtime.parent.parent)),
+            self.system.commands,
+        )
+        self.assertIn(
+            (str(self.paths.runtime), "-m", "pip", "install", "websockets==15.0.1"),
+            self.system.commands,
+        )
         self.assertIn(("hyprctl", "reload", "config-only"), self.system.commands)
 
         self.apply()
@@ -104,18 +125,27 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(
             self.paths.bindings.read_text(), self.bindings_original + "-- later personal edit\n"
         )
-        self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
+        self.assertFalse((self.paths.bin_dir / "dictation-llm").exists())
         self.assertFalse((self.paths.bin_dir / "polish-clipboard").exists())
-        self.assertFalse((self.paths.bin_dir / "voxtype-rephrase").is_symlink())
+        self.assertFalse((self.paths.bin_dir / install.LAUNCHER).exists())
         self.assertFalse((self.paths.state / "installed.json").exists())
         self.assertTrue(self.paths.api_key.exists(), "uninstall keeps the key")
+        self.assertTrue(self.paths.elevenlabs_api_key.exists(), "uninstall keeps recognition key")
         self.assertTrue(self.paths.vocabulary.exists(), "uninstall keeps the vocabulary")
 
     def test_settings_change_replaces_the_managed_block(self):
         self.apply()
         self.paths.settings.parent.mkdir(parents=True, exist_ok=True)
         self.paths.settings.write_text(
-            json.dumps({"chords": ["SUPER + D"], "translate_key": "Alt_R", "polish_chord": None})
+            json.dumps(
+                {
+                    "chords": ["SUPER + D"],
+                    "translate_key": "Alt_R",
+                    "polish_chord": None,
+                    "mode": "translate",
+                    "microphone": "42",
+                }
+            )
         )
         self.apply()
         bindings = self.paths.bindings.read_text()
@@ -124,61 +154,42 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("F23", bindings)
         self.assertIn('hl.is_key_down("Alt_R")', bindings)
         self.assertNotIn("polish-clipboard", bindings)
+        self.assertNotIn("start --mode rephrase", bindings)
+        self.assertIn('omarchy-dictation start" .. " --operation "', bindings)
 
-    def test_refuses_to_shadow_existing_profiles_or_chords(self):
+    def test_refuses_to_shadow_existing_chords_but_ignores_unrelated_profiles(self):
         self.paths.voxtype_config.write_text(
             self.voxtype_original + '[profiles.translate]\npost_process_command = "mine"\n'
         )
-        with self.assertRaisesRegex(ValueError, r"\[profiles\.translate\] already exists"):
-            self.apply()
-        self.paths.voxtype_config.write_text(self.voxtype_original)
+        self.apply()
+        self.assertIn('post_process_command = "mine"', self.paths.voxtype_config.read_text())
         self.paths.bindings.write_text('hl.bind("ALT + SHIFT + F23", function() end)\n')
         with self.assertRaisesRegex(ValueError, "already bound"):
             self.apply()
         self.paths.bindings.write_text('o.bind("SUPER + SHIFT + T", "Mine", "true")\n')
         with self.assertRaisesRegex(ValueError, "SUPER \\+ SHIFT \\+ T.*already bound"):
             self.apply()
-        self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
 
-    def test_verification_waits_for_the_daemon_to_come_back(self):
-        answers = iter(
-            [
-                "Error: Voxtype daemon is not running (stale PID file removed).\n",
-                "Error: Voxtype daemon is not running.\n",
-                PROBE_OUTPUT,
-            ]
-        )
-
-        def slow_probe(args, **kwargs):
-            self.system.commands.append(tuple(args))
-            return subprocess.CompletedProcess(args, 1, stdout="", stderr=next(answers))
-
+    def test_failed_verification_restores_preexisting_commands_and_marker(self):
+        self.apply()
+        marker = (self.paths.state / "installed.json").read_text()
+        bindings = self.paths.bindings.read_text()
+        command = self.paths.bin_dir / install.LAUNCHER
+        original = command.read_bytes()
+        command.chmod(0o750)
         with (
             patch.object(install, "run", side_effect=self.system.run),
-            patch.object(install.subprocess, "run", side_effect=slow_probe),
-            patch.object(install.time, "sleep") as sleep,
+            patch.object(
+                install, "restart_services", side_effect=[RuntimeError("bad config"), None]
+            ),
+            self.assertRaisesRegex(RuntimeError, "bad config"),
         ):
-            install.apply(ROOT, self.paths, prompt=lambda _: "csk-test-key")
-        self.assertEqual(sleep.call_count, 2)
-        self.assertTrue((self.paths.state / "installed.json").exists())
-
-    def test_failed_verification_rolls_everything_back(self):
-        def bad_probe(args, **kwargs):
-            return subprocess.CompletedProcess(
-                args, 1, stdout="", stderr="Available profiles: other\n"
-            )
-
-        with (
-            patch.object(install, "run", side_effect=self.system.run),
-            patch.object(install.subprocess, "run", side_effect=bad_probe),
-            patch.object(install.time, "sleep"),
-            self.assertRaisesRegex(RuntimeError, "does not list the profiles"),
-        ):
-            install.apply(ROOT, self.paths, prompt=lambda _: "csk-test-key")
+            install.apply(self.source, self.paths, prompt=lambda _: "test-key")
         self.assertEqual(self.paths.voxtype_config.read_text(), self.voxtype_original)
-        self.assertEqual(self.paths.bindings.read_text(), self.bindings_original)
-        self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
-        self.assertFalse((self.paths.state / "installed.json").exists())
+        self.assertEqual(self.paths.bindings.read_text(), bindings)
+        self.assertEqual(command.read_bytes(), original)
+        self.assertEqual(command.stat().st_mode & 0o777, 0o750)
+        self.assertEqual((self.paths.state / "installed.json").read_text(), marker)
 
     def test_edit_block_round_trips_without_trailing_newline(self):
         original = "-- no newline at end"
@@ -198,6 +209,15 @@ class InstallerTests(unittest.TestCase):
             {"translate_key": "Shift_R; os.execute"},
             {"post_process_timeout_ms": "20000"},
             {"post_process_timeout_ms": 10},
+            {"post_process_timeout_ms": True},
+            {"mode": "polish"},
+            {"mode": []},
+            {"microphone": ""},
+            {"microphone": "--target=evil"},
+            {"microphone": "input\nnode"},
+            {"microphone": "input\x00node"},
+            {"microphone": "input; rm"},
+            {"microphone": 123},
             {"polish_chord": "SUPER + T; rm"},
             {"polish_chord": ["SUPER + T"]},
             {"unknown": 1},
@@ -210,6 +230,7 @@ class InstallerTests(unittest.TestCase):
             {"base_url": "https://user@api.example.com/v1"},
             {"base_url": "https://api.example.com:notaport/v1"},
             {"base_url": "https://api.example.com:99999/v1"},
+            {"base_url": "https://api.example.com/\x00"},
             {"model": ""},
             {"model": "gpt 5"},
             {"reasoning_effort": "none; rm"},
@@ -234,15 +255,450 @@ class InstallerTests(unittest.TestCase):
         )
         settings = install.load_settings(self.paths.settings)
         self.assertEqual(install.api_host(settings), "localhost:11434")
+        for microphone in ("auto", "123", "alsa_input.usb-Example.analog-stereo"):
+            self.paths.settings.write_text(json.dumps({"microphone": microphone}))
+            self.assertEqual(install.load_settings(self.paths.settings)["microphone"], microphone)
+        for malformed in ("[", "[]", "null"):
+            self.paths.settings.write_text(malformed)
+            with self.assertRaises(ValueError):
+                install.load_settings(self.paths.settings)
+
+    def test_internal_chord_collisions_abort_before_setup_side_effects(self):
+        for settings in (
+            {"polish_chord": "F23"},
+            {"polish_chord": "SHIFT+F23"},
+            {"chords": ["Escape"]},
+            {"polish_chord": "Escape"},
+            {"chords": ["CTRL + SHIFT + F23"], "polish_chord": "SHIFT + CTRL + F23"},
+            {"chords": ["CTRL + F23", "CTRL+F23"]},
+        ):
+            with self.subTest(settings=settings):
+                install.atomic_write(self.paths.settings, json.dumps(settings))
+                with (
+                    patch.object(install, "run") as run,
+                    patch.object(install, "ensure_api_key") as key,
+                    self.assertRaises(ValueError),
+                ):
+                    install.apply(self.source, self.paths)
+                run.assert_not_called()
+                key.assert_not_called()
+                self.assertEqual(self.paths.bindings.read_text(), self.bindings_original)
+                self.assertFalse((self.paths.state / "installed.json").exists())
+        for polish in ("CTRL + SHIFT + F23", "CTRL + Escape", None):
+            with self.subTest(valid_polish=polish):
+                install.atomic_write(
+                    self.paths.settings,
+                    json.dumps({"chords": ["CTRL + F23"], "polish_chord": polish}),
+                )
+                self.assertEqual(install.load_settings(self.paths.settings)["polish_chord"], polish)
 
     def test_missing_api_key_aborts_before_touching_files(self):
         with (
             patch.object(install, "run", side_effect=self.system.run),
             self.assertRaisesRegex(ValueError, "API key is required"),
         ):
-            install.apply(ROOT, self.paths, prompt=lambda _: "   ")
+            install.apply(self.source, self.paths, prompt=lambda _: "   ")
         self.assertEqual(self.paths.voxtype_config.read_text(), self.voxtype_original)
+        self.assertEqual(self.paths.bindings.read_text(), self.bindings_original)
+        self.assertFalse((self.paths.bin_dir / install.LAUNCHER).exists())
+        self.assertEqual(self.system.commands, [])
+
+    def test_missing_recognition_key_aborts_before_desktop_or_pip(self):
+        install.atomic_write(self.paths.api_key, "text-key\n", 0o600)
+        with (
+            patch.object(install, "run", side_effect=self.system.run),
+            self.assertRaisesRegex(ValueError, "ElevenLabs"),
+        ):
+            install.apply(self.source, self.paths, prompt=lambda _: "")
+        self.assertEqual(self.paths.bindings.read_text(), self.bindings_original)
+        self.assertEqual(self.system.commands, [])
+
+    def test_legacy_migration_and_vocabulary_are_narrow(self):
+        block = (
+            f"\n{install.TOML_BEGIN}\n[profiles.rephrase]\n"
+            f'post_process_command = "old"\n{install.TOML_END}\n'
+        )
+        self.paths.voxtype_config.write_text(self.voxtype_original + block + "# personal\n")
+        self.paths.legacy_vocabulary.write_text("Personal product\n")
+        install.atomic_write(self.paths.state / "installed.json", '{"version":"0.1.0"}')
+        self.assertIn("legacy", install.runtime_error(self.source, self.paths))
+        self.apply()
+        self.assertEqual(
+            self.paths.voxtype_config.read_text(), self.voxtype_original + "# personal\n"
+        )
+        self.assertEqual(self.paths.vocabulary.read_text(), "Personal product\n")
+        self.paths.legacy_vocabulary.write_text("Changed old vocabulary\n")
+        self.apply()
+        self.assertEqual(self.paths.vocabulary.read_text(), "Personal product\n")
+
+    def test_no_voxtype_config_is_required(self):
+        self.paths.voxtype_config.unlink()
+        self.apply()
+        self.assertFalse(self.paths.voxtype_config.exists())
+
+    def test_uninstall_keeps_personal_command_and_invalid_settings(self):
+        self.apply()
+        command = self.paths.bin_dir / install.SCRIPT
+        command.write_bytes(b"personal binary\x80")
+        self.paths.settings.write_text("invalid JSON")
+        self.apply(remove=True)
+        self.assertEqual(command.read_bytes(), b"personal binary\x80")
+        self.assertEqual(self.paths.settings.read_text(), "invalid JSON")
+
+    def test_first_install_refuses_binary_command_before_side_effects(self):
+        self.paths.bin_dir.mkdir()
+        command = self.paths.bin_dir / install.LAUNCHER
+        command.write_bytes(b"\x7fELF\x80personal")
+        command.chmod(0o751)
+        with (
+            patch.object(install, "run", side_effect=self.system.run),
+            patch.object(install, "ensure_api_key") as credentials,
+            self.assertRaisesRegex(ValueError, "unowned command"),
+        ):
+            install.apply(self.source, self.paths, prompt=lambda _: "key")
+        credentials.assert_not_called()
+        self.assertEqual(self.system.commands, [])
+        self.assertEqual(command.read_bytes(), b"\x7fELF\x80personal")
+        self.assertEqual(command.stat().st_mode & 0o777, 0o751)
+        self.assertFalse((self.paths.state / "installed.json").exists())
+        self.assertFalse(self.paths.settings.exists())
+        self.assertFalse(self.paths.vocabulary.exists())
+        self.assertEqual(self.paths.bindings.read_text(), self.bindings_original)
+
+    def legacy_commands(self):
+        self.paths.bin_dir.mkdir(exist_ok=True)
+        for name in install.LEGACY_HASHES:
+            data = subprocess.run(
+                ["git", "show", f"610ae09:{name}"], cwd=ROOT, check=True, capture_output=True
+            ).stdout
+            install.atomic_write(self.paths.bin_dir / name, data, 0o755)
+        for name in install.LEGACY_LINKS:
+            (self.paths.bin_dir / name).symlink_to("voxtype-llm")
+        install.atomic_write(self.paths.state / "installed.json", '{"version":"0.1.0"}\n')
+
+    def test_exact_legacy_commands_migrate_and_uninstall(self):
+        for remove in (False, True):
+            with self.subTest(remove=remove):
+                self.legacy_commands()
+                self.apply(remove=remove)
+                for name in ("voxtype-llm", *install.LEGACY_LINKS):
+                    path = self.paths.bin_dir / name
+                    self.assertFalse(path.exists() or path.is_symlink())
+                if not remove:
+                    self.apply(remove=True)
+                self.assertFalse((self.paths.bin_dir / install.WRAPPER).exists())
+
+    def test_markerless_legacy_remnants_preserve_replaced_links(self):
+        self.legacy_commands()
+        (self.paths.state / "installed.json").unlink()
+        replacement = self.paths.bin_dir / install.LEGACY_LINKS[0]
+        replacement.unlink()
+        replacement.symlink_to("personal-target")
+        self.apply(remove=True)
+        self.assertEqual(os.readlink(replacement), "personal-target")
         self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
+        self.assertFalse((self.paths.bin_dir / install.LEGACY_LINKS[1]).is_symlink())
+        self.assertFalse((self.paths.bin_dir / install.WRAPPER).exists())
+
+    def test_legacy_removal_rolls_back_files_links_and_marker(self):
+        self.legacy_commands()
+        files = {name: (self.paths.bin_dir / name).read_bytes() for name in install.LEGACY_HASHES}
+        marker = (self.paths.state / "installed.json").read_bytes()
+        for remove in (False, True):
+            with (
+                self.subTest(remove=remove),
+                patch.object(install, "run", side_effect=self.system.run),
+                patch.object(install, "restart_services", side_effect=[RuntimeError("bad"), None]),
+                self.assertRaisesRegex(RuntimeError, "bad"),
+            ):
+                install.apply(self.source, self.paths, remove=remove, prompt=lambda _: "key")
+            for name, data in files.items():
+                self.assertEqual((self.paths.bin_dir / name).read_bytes(), data)
+            for name in install.LEGACY_LINKS:
+                self.assertEqual(os.readlink(self.paths.bin_dir / name), "voxtype-llm")
+            self.assertEqual((self.paths.state / "installed.json").read_bytes(), marker)
+
+    def test_legacy_personal_replacements_are_preserved(self):
+        self.legacy_commands()
+        (self.paths.bin_dir / "voxtype-llm").write_text("personal script")
+        (self.paths.bin_dir / install.WRAPPER).write_text("personal clipboard")
+        with self.assertRaisesRegex(ValueError, "unowned command"):
+            self.apply()
+        self.apply(remove=True)
+        self.assertEqual((self.paths.bin_dir / "voxtype-llm").read_text(), "personal script")
+        self.assertEqual((self.paths.bin_dir / install.WRAPPER).read_text(), "personal clipboard")
+        for name in install.LEGACY_LINKS:
+            self.assertTrue((self.paths.bin_dir / name).is_symlink())
+
+    def test_collisions_include_symlinks_directories_and_replaced_launchers(self):
+        self.apply()
+        for kind in ("symlink", "directory", "file"):
+            path = self.paths.bin_dir / install.LAUNCHER
+            if path.is_dir():
+                path.rmdir()
+            else:
+                path.unlink()
+            if kind == "symlink":
+                path.symlink_to("missing-personal-target")
+            elif kind == "directory":
+                path.mkdir()
+            else:
+                path.write_text("personal")
+            with (
+                self.subTest(kind=kind),
+                patch.object(install, "ensure_api_key") as credentials,
+                patch.object(install, "provision_runtime") as provision,
+                self.assertRaisesRegex(ValueError, "unowned command"),
+            ):
+                self.apply()
+            credentials.assert_not_called()
+            provision.assert_not_called()
+        with (
+            patch.object(install.Paths, "default", return_value=self.paths),
+            patch.object(sys, "argv", ["install.py"]),
+            patch("builtins.input") as confirmation,
+            patch.object(install, "preflight") as preflight,
+            self.assertRaisesRegex(ValueError, "unowned command"),
+        ):
+            install.main()
+        confirmation.assert_not_called()
+        preflight.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("lua"), "Lua not installed")
+    def test_lua_callbacks_track_physical_key_and_operation(self):
+        settings = dict(install.DEFAULT_SETTINGS, chords=["F23", "SHIFT + F23", "SUPER + D"])
+        harness = """
+local presses, releases, commands = {}, {}, {}
+local translate = false
+hl = {
+  bind = function(key, callback, options)
+    if options.release then releases[key] = callback else presses[key] = callback end
+  end,
+  is_key_down = function() return translate end,
+  exec_cmd = function(command) table.insert(commands, command) end
+}
+o = {bind = function() end}
+"""
+        checks = """
+releases.D()
+assert(#commands == 0)
+presses.F23()
+presses.F23()
+presses['SHIFT + F23']()
+presses['SUPER + D']()
+releases.D()
+assert(#commands == 1)
+releases.F23()
+releases.F23()
+assert(#commands == 2)
+local first = commands[1]:match('start %-%-operation ([%w_-]+)$')
+assert(first and #first <= 128)
+assert(commands[2]:match('stop %-%-operation ([%w_-]+)$') == first)
+translate = true
+presses['SUPER + D']()
+releases.F23()
+assert(#commands == 3)
+releases.D()
+assert(#commands == 4)
+local second = commands[3]:match('start %-%-mode translate %-%-operation ([%w_-]+)$')
+assert(second and second ~= first)
+assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
+"""
+        subprocess.run(
+            ["lua", "-"],
+            input=harness + install.lua_block(settings, Path("/opt/bin")) + checks,
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+
+    def test_credentials_wake_only_existing_marker_after_both_saves(self):
+        marker = self.paths.state / "installed.json"
+        original = b'{ "version": "0.2.0", "custom": true }\n'
+        real_save = install.ensure_api_key
+        for outcome in ("failure", "success", "missing"):
+            if outcome == "missing":
+                marker.unlink()
+            else:
+                install.atomic_write(marker, original, 0o640)
+            inode = marker.stat().st_ino if marker.exists() else None
+            saved = []
+
+            def save(path, host, replace=False):
+                self.assertEqual(marker.stat().st_ino if marker.exists() else None, inode)
+                saved.append(path)
+                if outcome == "failure" and len(saved) == 2:
+                    raise ValueError("repair failed")
+                real_save(path, host, prompt=lambda _: "repaired-key", replace=replace)
+
+            with (
+                self.subTest(outcome=outcome),
+                patch.object(install.Paths, "default", return_value=self.paths),
+                patch.object(sys, "argv", ["install.py", "--credentials"]),
+                patch.object(install.os, "isatty", return_value=True),
+                patch.object(install, "ensure_api_key", side_effect=save),
+            ):
+                if outcome == "failure":
+                    with self.assertRaisesRegex(ValueError, "repair failed"):
+                        install.main()
+                else:
+                    install.main()
+            self.assertEqual(saved, [self.paths.api_key, self.paths.elevenlabs_api_key])
+            if outcome == "missing":
+                self.assertFalse(marker.exists())
+            else:
+                self.assertEqual(marker.read_bytes(), original)
+                self.assertEqual(marker.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(marker.stat().st_ino == inode, outcome == "failure")
+
+    def test_detached_credentials_launcher_does_not_wake_marker(self):
+        marker = self.paths.state / "installed.json"
+        install.atomic_write(marker, '{"version":"0.2.0"}\n')
+        inode = marker.stat().st_ino
+        with (
+            patch.object(install.Paths, "default", return_value=self.paths),
+            patch.object(sys, "argv", ["install.py", "--credentials"]),
+            patch.object(install.os, "isatty", return_value=False),
+            patch.object(install, "run", side_effect=self.system.run),
+            patch.object(install, "ensure_api_key") as save,
+        ):
+            install.main()
+        save.assert_not_called()
+        self.assertEqual(marker.stat().st_ino, inode)
+
+    def test_run_daemon_checks_dependencies_without_installing_or_leaking(self):
+        output = io.StringIO()
+        with (
+            redirect_stdout(output),
+            patch.object(install.subprocess, "Popen") as execute,
+            patch.object(install, "run") as run,
+        ):
+            install.run_daemon(self.source, self.paths)
+        state = json.loads(output.getvalue())
+        self.assertEqual(state["phase"], "error")
+        execute.assert_not_called()
+        run.assert_not_called()
+        self.apply()
+        install.atomic_write(self.paths.runtime, "fake runtime", 0o755)
+        with (
+            patch.object(install.shutil, "which", return_value="/mock/tool"),
+            patch.object(
+                install,
+                "run",
+                side_effect=subprocess.CalledProcessError(1, "dependency", stderr="secret-key"),
+            ),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            install.run_daemon(self.source, self.paths)
+        self.assertEqual(json.loads(output.getvalue())["phase"], "error")
+        self.assertNotIn("secret-key", output.getvalue())
+        with (
+            patch.object(install.shutil, "which", return_value="/mock/tool"),
+            patch.object(install, "run", side_effect=self.system.run),
+            patch.object(install.subprocess, "Popen") as execute,
+        ):
+            install.run_daemon(self.source, self.paths)
+        execute.assert_called_once_with(
+            [str(self.paths.runtime), str(self.source / "voice.py"), "daemon", "--stdio"],
+            start_new_session=True,
+        )
+        execute.return_value.wait.assert_called_once_with()
+        self.assertNotIn("pip", self.system.commands[-1])
+        with patch.object(install.shutil, "which", return_value=None):
+            self.assertIn("pw-record", install.runtime_error(self.source, self.paths))
+
+    def test_preflight_requires_only_standalone_tools_and_desktop(self):
+        with (
+            patch.object(install.os, "geteuid", return_value=1000),
+            patch.object(install.os, "access", return_value=True),
+            patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "test"}),
+            patch.object(install.shutil, "which", return_value="/mock/tool") as which,
+        ):
+            install.preflight(self.paths)
+        checked = [call.args[0] for call in which.call_args_list]
+        self.assertNotIn("voxtype", checked)
+        self.assertNotIn("systemctl", checked)
+        self.assertIn("wtype", checked)
+        self.assertIn("omarchy-version", checked)
+
+    def test_runtime_version_guard_rejects_old_new_and_reused_environments(self):
+        for existing in (False, True):
+            for version in ((3, 10), (3, 11)):
+                with self.subTest(existing=existing, version=version):
+                    self.paths.runtime.unlink(missing_ok=True)
+                    if existing:
+                        install.atomic_write(self.paths.runtime, "fake interpreter", 0o755)
+                    commands = []
+
+                    def run(*args):
+                        commands.append(args)
+                        if args[1] == "-c":
+                            # Execute the actual guard against both sides of its
+                            # version boundary, independently of the host Python.
+                            subprocess.run(
+                                [
+                                    sys.executable,
+                                    "-c",
+                                    f"import sys; sys.version_info={version}; " + args[2],
+                                ],
+                                check=True,
+                            )
+                        return ""
+
+                    with patch.object(install, "run", side_effect=run):
+                        if version == (3, 10):
+                            with self.assertRaisesRegex(RuntimeError, "Python 3.11 or newer"):
+                                install.provision_runtime(self.paths)
+                        else:
+                            install.provision_runtime(self.paths)
+                    self.assertEqual(any("venv" in args for args in commands), not existing)
+                    self.assertEqual(any("pip" in args for args in commands), version == (3, 11))
+                    self.assertFalse((self.paths.state / "installed.json").exists())
+
+    def test_launch_and_credentials_open_terminal_without_setup(self):
+        for option in ("--launch", "--credentials"):
+            with (
+                self.subTest(option=option),
+                patch.object(install.Paths, "default", return_value=self.paths),
+                patch.object(sys, "argv", ["install.py", option]),
+                patch.object(install.os, "isatty", return_value=False),
+                patch.object(install, "run", side_effect=self.system.run),
+                patch.object(install, "preflight") as preflight,
+            ):
+                install.main()
+                preflight.assert_not_called()
+                self.assertEqual(
+                    self.system.commands[-1][0],
+                    "omarchy-launch-floating-terminal-with-presentation",
+                )
+
+        with (
+            patch.object(sys, "argv", ["install.py", "--launch"]),
+            patch.object(install, "runtime_error", return_value=None),
+            patch.object(install, "run") as run,
+        ):
+            install.main()
+        run.assert_not_called()
+
+    def test_key_replacement_is_private_and_does_not_echo_secrets(self):
+        install.atomic_write(self.paths.api_key, "previous\n", 0o600)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            install.ensure_api_key(
+                self.paths.api_key, "provider", prompt=lambda _: "replacement", replace=True
+            )
+        self.assertEqual(self.paths.api_key.read_text(), "replacement\n")
+        self.assertEqual(self.paths.api_key.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.paths.api_key.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_installed_script_launcher_uses_current_checkout(self):
+        self.apply()
+        (self.source / install.SCRIPT).write_text("printf 'updated source'\n")
+        result = subprocess.run(
+            [str(self.paths.bin_dir / install.SCRIPT)], check=True, capture_output=True, text=True
+        )
+        self.assertEqual(result.stdout, "updated source")
 
 
 class FakeProvider(BaseHTTPRequestHandler):
@@ -277,15 +733,15 @@ class ScriptTests(unittest.TestCase):
             base_url = f"http://{host}:{server.server_port}/v1/"
             settings_file.write_text(json.dumps({"base_url": base_url, **settings}))
             result = subprocess.run(
-                ["bash", str(ROOT / "voxtype-llm"), "--mode", "translate"],
+                ["bash", str(ROOT / "dictation-llm"), "--mode", "translate"],
                 input="你好",
                 capture_output=True,
                 text=True,
                 env={
                     "HOME": "/nonexistent",
                     "PATH": "/usr/bin:/bin",
-                    "VOXTYPE_LLM_API_KEY": "test-key",
-                    "VOXTYPE_LLM_SETTINGS_FILE": str(settings_file),
+                    "DICTATION_LLM_API_KEY": "test-key",
+                    "DICTATION_LLM_SETTINGS_FILE": str(settings_file),
                     # A dead proxy: local providers must be reached directly.
                     "http_proxy": "http://127.0.0.1:9",
                     "ALL_PROXY": "http://127.0.0.1:9",
@@ -323,15 +779,15 @@ class ScriptTests(unittest.TestCase):
                 settings_file = Path(config, "settings.json")
                 settings_file.write_text(json.dumps(settings))
                 result = subprocess.run(
-                    ["bash", str(ROOT / "voxtype-llm"), "--mode", "rephrase"],
+                    ["bash", str(ROOT / "dictation-llm"), "--mode", "rephrase"],
                     input="hello world",
                     capture_output=True,
                     text=True,
                     env={
                         "HOME": "/nonexistent",
                         "PATH": "/usr/bin:/bin",
-                        "VOXTYPE_LLM_API_KEY": "test-key",
-                        "VOXTYPE_LLM_SETTINGS_FILE": str(settings_file),
+                        "DICTATION_LLM_API_KEY": "test-key",
+                        "DICTATION_LLM_SETTINGS_FILE": str(settings_file),
                     },
                     check=True,
                 )
@@ -349,7 +805,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(set(minimal), {"model", "max_completion_tokens", "messages"})
 
     def test_script_defaults_match_the_installer(self):
-        script = (ROOT / "voxtype-llm").read_text()
+        script = (ROOT / "dictation-llm").read_text()
         defaults = install.DEFAULT_SETTINGS
         self.assertIn(f'DEFAULT_BASE_URL="{defaults["base_url"]}"', script)
         self.assertIn(f'DEFAULT_MODEL="{defaults["model"]}"', script)
@@ -366,15 +822,15 @@ class ScriptTests(unittest.TestCase):
         ):
             with self.subTest(url=url):
                 result = subprocess.run(
-                    ["bash", str(ROOT / "voxtype-llm"), "--mode", "rephrase"],
+                    ["bash", str(ROOT / "dictation-llm"), "--mode", "rephrase"],
                     input="hello world",
                     capture_output=True,
                     text=True,
                     env={
                         "HOME": "/nonexistent",
                         "PATH": "/usr/bin:/bin",
-                        "VOXTYPE_LLM_API_KEY": "test-key",
-                        "VOXTYPE_LLM_BASE_URL": url,
+                        "DICTATION_LLM_API_KEY": "test-key",
+                        "DICTATION_LLM_BASE_URL": url,
                     },
                     check=True,
                 )
@@ -382,7 +838,7 @@ class ScriptTests(unittest.TestCase):
                 self.assertIn("base_url must be https", result.stderr)
 
     def test_script_parses_and_passes_input_through_without_key(self):
-        script = ROOT / "voxtype-llm"
+        script = ROOT / "dictation-llm"
         subprocess.run(["bash", "-n", str(script)], check=True)
         result = subprocess.run(
             ["bash", str(script), "--mode", "rephrase"],
@@ -392,7 +848,7 @@ class ScriptTests(unittest.TestCase):
             env={
                 "HOME": "/nonexistent",
                 "PATH": "/usr/bin:/bin",
-                "VOXTYPE_LLM_API_KEY_FILE": "/nonexistent",
+                "DICTATION_LLM_API_KEY_FILE": "/nonexistent",
             },
             check=True,
         )
@@ -406,7 +862,7 @@ class ScriptTests(unittest.TestCase):
             env={
                 "HOME": "/nonexistent",
                 "PATH": "/usr/bin:/bin",
-                "VOXTYPE_LLM_API_KEY_FILE": "/nonexistent",
+                "DICTATION_LLM_API_KEY_FILE": "/nonexistent",
             },
         )
         self.assertEqual((strict.returncode, strict.stdout), (1, ""))
