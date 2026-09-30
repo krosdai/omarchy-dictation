@@ -132,6 +132,14 @@ def load_settings(path):
     polish = settings["polish_chord"]
     if polish is not None and not _is_chord(polish):
         raise ValueError("settings.polish_chord must be a Hyprland chord or null")
+    recording_chords = {_chord_key(chord) for chord in chords}
+    polish_key = _chord_key(polish) if polish else None
+    if len(recording_chords) != len(chords):
+        raise ValueError("settings.chords must not contain duplicate chords")
+    if _chord_key("Escape") in (*recording_chords, polish_key):
+        raise ValueError("Escape is reserved for dictation cancellation")
+    if polish_key in recording_chords:
+        raise ValueError("settings.polish_chord must not overlap a dictation chord")
     base_url = settings["base_url"]
     try:
         url = urllib.parse.urlsplit(base_url) if isinstance(base_url, str) else None
@@ -173,6 +181,11 @@ def api_host(settings):
 
 def _is_chord(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_]+( *\+ *[A-Za-z0-9_]+)*", value)
+
+
+def _chord_key(value):
+    parts = [part.strip().upper() for part in value.split("+")]
+    return frozenset(parts[:-1]), parts[-1]
 
 
 # ----------------------------------------------------------------- managed blocks

@@ -263,6 +263,35 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 install.load_settings(self.paths.settings)
 
+    def test_internal_chord_collisions_abort_before_setup_side_effects(self):
+        for settings in (
+            {"polish_chord": "F23"},
+            {"polish_chord": "SHIFT+F23"},
+            {"chords": ["Escape"]},
+            {"polish_chord": "Escape"},
+            {"chords": ["CTRL + SHIFT + F23"], "polish_chord": "SHIFT + CTRL + F23"},
+            {"chords": ["CTRL + F23", "CTRL+F23"]},
+        ):
+            with self.subTest(settings=settings):
+                install.atomic_write(self.paths.settings, json.dumps(settings))
+                with (
+                    patch.object(install, "run") as run,
+                    patch.object(install, "ensure_api_key") as key,
+                    self.assertRaises(ValueError),
+                ):
+                    install.apply(self.source, self.paths)
+                run.assert_not_called()
+                key.assert_not_called()
+                self.assertEqual(self.paths.bindings.read_text(), self.bindings_original)
+                self.assertFalse((self.paths.state / "installed.json").exists())
+        for polish in ("CTRL + SHIFT + F23", "CTRL + Escape", None):
+            with self.subTest(valid_polish=polish):
+                install.atomic_write(
+                    self.paths.settings,
+                    json.dumps({"chords": ["CTRL + F23"], "polish_chord": polish}),
+                )
+                self.assertEqual(install.load_settings(self.paths.settings)["polish_chord"], polish)
+
     def test_missing_api_key_aborts_before_touching_files(self):
         with (
             patch.object(install, "run", side_effect=self.system.run),
