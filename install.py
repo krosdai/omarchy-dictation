@@ -409,6 +409,13 @@ def restart_services():
 def provision_runtime(paths):
     if not paths.runtime.exists():
         run("/usr/bin/python", "-m", "venv", str(paths.runtime.parent.parent))
+    try:
+        run(str(paths.runtime), "-c", "import sys; sys.exit(sys.version_info < (3, 11))")
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"Python 3.11 or newer is required; recreate {paths.runtime.parent.parent} "
+            "with a compatible /usr/bin/python, then run setup again."
+        ) from error
     run(str(paths.runtime), "-m", "pip", "install", "websockets==15.0.1")
 
 
@@ -437,7 +444,10 @@ def runtime_error(source, paths):
             if not key.read_text().strip():
                 return "Credentials missing; open credential setup in a terminal."
         run(
-            str(paths.runtime), "-c", "import websockets; assert websockets.__version__ == '15.0.1'"
+            str(paths.runtime),
+            "-c",
+            "import sys, websockets; "
+            "sys.exit(sys.version_info < (3, 11) or websockets.__version__ != '15.0.1')",
         )
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError):
         return "Settings, credentials or runtime dependencies need setup in a terminal."

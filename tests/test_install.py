@@ -592,6 +592,40 @@ assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
         self.assertIn("wtype", checked)
         self.assertIn("omarchy-version", checked)
 
+    def test_runtime_version_guard_rejects_old_new_and_reused_environments(self):
+        for existing in (False, True):
+            for version in ((3, 10), (3, 11)):
+                with self.subTest(existing=existing, version=version):
+                    self.paths.runtime.unlink(missing_ok=True)
+                    if existing:
+                        install.atomic_write(self.paths.runtime, "fake interpreter", 0o755)
+                    commands = []
+
+                    def run(*args):
+                        commands.append(args)
+                        if args[1] == "-c":
+                            # Execute the actual guard against both sides of its
+                            # version boundary, independently of the host Python.
+                            subprocess.run(
+                                [
+                                    sys.executable,
+                                    "-c",
+                                    f"import sys; sys.version_info={version}; " + args[2],
+                                ],
+                                check=True,
+                            )
+                        return ""
+
+                    with patch.object(install, "run", side_effect=run):
+                        if version == (3, 10):
+                            with self.assertRaisesRegex(RuntimeError, "Python 3.11 or newer"):
+                                install.provision_runtime(self.paths)
+                        else:
+                            install.provision_runtime(self.paths)
+                    self.assertEqual(any("venv" in args for args in commands), not existing)
+                    self.assertEqual(any("pip" in args for args in commands), version == (3, 11))
+                    self.assertFalse((self.paths.state / "installed.json").exists())
+
     def test_launch_and_credentials_open_terminal_without_setup(self):
         for option in ("--launch", "--credentials"):
             with (
