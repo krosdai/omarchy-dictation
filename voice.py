@@ -561,10 +561,11 @@ class Backend:
                 ready,
             )
             await capture.close()
-            await self.phase("processing", text=raw)
             if not raw:
-                await self.phase("done", message="No speech recognized")
+                await self.emit({"type": "preview", "text": ""})
+                await self.phase("idle")
                 return
+            await self.phase("processing", text=raw)
             message = ""
             text = raw
             try:

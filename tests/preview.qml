@@ -55,6 +55,7 @@ ShellRoot {
                 phase: state.phase,
                 text: state.transcript,
                 title: state.title,
+                hudVisible: hud.visible,
                 settingsOpen: settings.opened,
                 connected: state.connected,
                 saving: state.saving,
