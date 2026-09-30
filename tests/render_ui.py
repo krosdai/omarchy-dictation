@@ -92,7 +92,7 @@ def production(env, artifacts):
             f" typed=pathlib.Path({str(preview / 'typed-text')!r})\n"
             " typed.write_bytes(text[:5])\n"
             f" pathlib.Path({str(preview / 'typing-pid')!r}).write_text(str(os.getpid()))\n"
-            " time.sleep(1.5)\n"
+            " time.sleep(3)\n"
             " typed.write_bytes(text)\n"
         )
         for name, script in scripts.items():
@@ -127,7 +127,8 @@ def production(env, artifacts):
                 return output
 
             def wait_phase(phase):
-                for _ in range(50):
+                # Include the backend's five-second automatic retry interval.
+                for _ in range(100):
                     try:
                         report = json.loads(ipc("dictation", "status"))
                         if report["phase"] == phase and report["connected"]:
@@ -139,15 +140,16 @@ def production(env, artifacts):
                     time.sleep(0.1)
                 raise AssertionError(f"Production service never reached {phase}")
 
-            def wait_exit(pids):
+            def wait_exit(pids, socket_removed=True):
                 for _ in range(50):
                     if all(not Path(f"/proc/{pid}").exists() for pid in pids):
                         break
                     time.sleep(0.1)
                 assert all(not Path(f"/proc/{pid}").exists() for pid in pids), pids
-                assert not (
-                    Path(env["XDG_RUNTIME_DIR"]) / "omarchy-dictation/control.sock"
-                ).exists()
+                if socket_removed:
+                    assert not (
+                        Path(env["XDG_RUNTIME_DIR"]) / "omarchy-dictation/control.sock"
+                    ).exists()
 
             try:
                 # First-run setup is stubbed, not a real terminal/desktop mutation.
@@ -162,9 +164,16 @@ def production(env, artifacts):
                 time.sleep(0.3)
                 report = json.loads(ipc("dictation", "status"))
                 assert report["phase"] == "error" and not report["connected"]
+                # A retry before any connection must preserve the setup error
+                # and must not launch another setup terminal.
+                time.sleep(5.5)
+                assert not (preview / "unexpected-terminal").exists()
                 ipc("integration", "panel")
                 report = json.loads(ipc("integration", "report"))
                 assert report["panelOpen"] and not report["canSave"]
+                assert report["message"] == (
+                    "Setup required; legacy installations must be upgraded in a terminal."
+                ), report
                 ipc("integration", "save")
                 assert json.loads((config / "settings.json").read_text()) == SAVED_SETTINGS
                 subprocess.run(
@@ -289,13 +298,45 @@ def production(env, artifacts):
                 assert (preview / "typed-text").read_bytes() == b"Compl", (
                     "QML must finish destruction while insertion is still partial"
                 )
-                wait_exit(typing_pids)
+                # Reload before the detached old daemon releases its singleton
+                # lock. Do not touch the panel or installed marker to recover.
+                process = subprocess.Popen(
+                    ["quickshell", "-p", str(preview), "--no-color"],
+                    env=env,
+                    stdout=log,
+                    stderr=log,
+                )
+                for _ in range(50):
+                    try:
+                        report = json.loads(ipc("dictation", "status"))
+                        if report["phase"] == "error" and not report["connected"]:
+                            break
+                    except (subprocess.CalledProcessError, ValueError):
+                        pass
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError("Reload did not encounter the old daemon's lock")
+                assert (preview / "typed-text").read_bytes() == b"Compl"
+                assert not json.loads(ipc("integration", "report"))["backendRunning"]
+                wait_exit(typing_pids, socket_removed=False)
                 assert (preview / "typed-text").read_bytes() == b"Complete fixture text."
+                wait_phase("idle")
+                assert marker.read_text() == marker_bytes
+                report = json.loads(ipc("integration", "report"))
+                assert not report["panelOpen"] and report["backendRunning"], report
+                recovered_pids = list(map(int, (preview / "backend-pids").read_text().split()))
+                ipc("integration", "quit")
+                process.wait(timeout=5)
+                wait_exit(recovered_pids)
                 (artifacts / "service-shutdown.json").write_text(
                     json.dumps(
                         {
                             "capture_pids_reaped": capture_pids,
                             "typing_pids_exited": typing_pids,
+                            "retry_pids_reaped": recovered_pids,
+                            "reload_initially_offline": True,
+                            "automatic_retry_connected": True,
+                            "marker_unchanged": marker.read_text() == marker_bytes,
                             "partial_at_unload": "Compl",
                             "final_text": (preview / "typed-text").read_text(),
                             "socket_removed": True,
@@ -314,7 +355,8 @@ def production(env, artifacts):
             assert error not in log, f"Production QML error: {error}"
     print(
         "Production service: offline form, missing keys, atomic repair, form persistence, "
-        "panel/widget, fixture PCM reaping and complete typing during QML destruction passed."
+        "panel/widget, fixture PCM reaping, complete typing during QML destruction, "
+        "and automatic recovery from a pre-connection reload race passed."
     )
 
 

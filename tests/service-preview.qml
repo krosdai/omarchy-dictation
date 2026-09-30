@@ -77,6 +77,7 @@ ShellRoot {
                 widgetOpen: widgetEntry.opened,
                 canSave: service.settingsForm.canSave,
                 backendRunning: service.backendRunning,
+                message: service.settingsForm.state.message,
                 values: service.settingsForm.formValues()
             });
         }

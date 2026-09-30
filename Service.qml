@@ -12,7 +12,6 @@ Item {
     readonly property string voiceTitle: voice.title
     readonly property var settingsForm: settings
     readonly property bool backendRunning: backend.running
-    property bool wasConnected: false
 
     function send(value) {
         if (backend.running && voice.connected) {
@@ -119,7 +118,6 @@ Item {
                         voice.receive(event);
                     if (event.type === "settings") {
                         voice.connected = true;
-                        root.wasConnected = true;
                     }
                 } catch (error) {
                     console.warn("Dictation backend returned an invalid event");
@@ -129,14 +127,14 @@ Item {
         onExited: {
             voice.connected = false;
             voice.saving = false;
-            if (root.wasConnected) {
+            if (voice.phase !== "error" || !voice.message) {
                 voice.receive({
                     type: "state",
                     phase: "error",
                     message: "Backend stopped; retrying shortly."
                 });
-                restartBackend.restart();
             }
+            restartBackend.restart();
         }
     }
     Timer {

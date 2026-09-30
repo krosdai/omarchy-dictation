@@ -195,7 +195,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(
                 return_value=[
                     {"value": "auto", "label": "Default"},
-                    {"value": "mic", "label": "Mic", "id": 9},
+                    {"value": "mic", "label": "Mic", "id": 9, "serial": "42"},
                 ]
             ),
         )
@@ -258,6 +258,23 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             recognizer.assert_not_awaited()
         self.assertEqual(self.backend.state["phase"], "cancelled")
         self.assertTrue(FakeCapture.instances[-1].closed)
+
+    async def test_saved_microphone_serial_works_in_panel_test(self):
+        await self.backend.configure({"microphone": "42"})
+        self.assertEqual(self.backend.settings_event["devices"][1]["serial"], "42")
+        for missing in ("43", ""):
+            self.assertFalse(
+                (await self.backend.command({"command": "test", "microphone": missing}))["accepted"]
+            )
+        with patch("voice.recognize", AsyncMock()) as recognizer:
+            result = await self.backend.command({"command": "test", "microphone": "42"})
+            self.assertTrue(result["accepted"])
+            self.assertEqual(self.backend.capture.microphone, "42")
+            await asyncio.sleep(0.01)
+            self.assertTrue(any(e["type"] == "levels" for e in self.events))
+            await self.backend.command({"command": "test"})
+            recognizer.assert_not_awaited()
+        self.assertEqual(load_settings(self.config / "settings.json")["microphone"], "42")
 
     async def test_missing_key_and_invalid_commands_are_rejected(self):
         for command in [

@@ -396,7 +396,10 @@ class Backend:
             self.settings_event = {
                 "type": "settings",
                 "settings": self.settings,
-                "devices": [{"value": d["value"], "label": d["label"]} for d in inputs],
+                "devices": [
+                    {"value": d["value"], "label": d["label"], "serial": d.get("serial", "")}
+                    for d in inputs
+                ],
                 "asr_configured": bool(
                     read_key(self.config / "elevenlabs_api_key", "ELEVENLABS_API_KEY")
                 ),
@@ -489,7 +492,10 @@ class Backend:
                     if command == "test" and "microphone" in value:
                         microphone = value["microphone"]
                         if not isinstance(microphone, str) or microphone not in {
-                            d["value"] for d in self.settings_event["devices"]
+                            identifier
+                            for d in self.settings_event["devices"]
+                            for identifier in (d["value"], d["serial"])
+                            if identifier
                         }:
                             raise VoiceError("The selected microphone is unavailable")
                     self.settings = self.settings | {"mode": mode}
