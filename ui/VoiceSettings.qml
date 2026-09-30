@@ -14,6 +14,7 @@ PanelWindow {
     property var targetScreen: null
     property bool valuesReady: false
     readonly property bool canSave: valuesReady && state.connected && !state.saving && !state.busy
+    readonly property string statusText: !state.connected ? (state.message || "Backend offline · enable the plugin or check its dependencies.") : feedback
     signal saveRequested(var settings)
     signal credentialsRequested
     signal testRequested(string microphone)
@@ -258,7 +259,7 @@ PanelWindow {
                     Layout.fillWidth: true
                     visible: text !== ""
                     textFormat: Text.PlainText
-                    text: !root.state.connected ? "Backend offline · enable the plugin or check its dependencies." : root.feedback
+                    text: root.statusText
                     color: Color.accent
                     font {
                         family: Style.font.family

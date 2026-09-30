@@ -78,6 +78,7 @@ ShellRoot {
                 canSave: service.settingsForm.canSave,
                 backendRunning: service.backendRunning,
                 message: service.settingsForm.state.message,
+                statusText: service.settingsForm.statusText,
                 values: service.settingsForm.formValues()
             });
         }

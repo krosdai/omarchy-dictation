@@ -33,7 +33,7 @@ QtObject {
         case "testing":
             return "Microphone test · no cloud upload";
         case "done":
-            return "Text inserted";
+            return transcript ? "Text inserted" : "No speech recognized";
         case "clipboard":
             return "Text copied · paste to insert";
         case "cancelled":

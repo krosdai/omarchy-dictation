@@ -54,10 +54,12 @@ ShellRoot {
             return JSON.stringify({
                 phase: state.phase,
                 text: state.transcript,
+                title: state.title,
                 settingsOpen: settings.opened,
                 connected: state.connected,
                 saving: state.saving,
                 canSave: settings.canSave,
+                statusText: settings.statusText,
                 values: settings.formValues(),
                 saved: state.settings
             });

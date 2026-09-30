@@ -162,6 +162,7 @@ def production(env, artifacts):
                         Path(env["XDG_RUNTIME_DIR"]) / "omarchy-dictation/control.sock"
                     ).exists()
 
+            typing_pids = []
             try:
                 # First-run setup is stubbed, not a real terminal/desktop mutation.
                 for _ in range(50):
@@ -185,6 +186,7 @@ def production(env, artifacts):
                 assert report["message"] == (
                     "Setup required; legacy installations must be upgraded in a terminal."
                 ), report
+                assert report["statusText"] == report["message"], report
                 ipc("integration", "save")
                 assert json.loads((config / "settings.json").read_text()) == SAVED_SETTINGS
                 subprocess.run(
@@ -299,11 +301,11 @@ def production(env, artifacts):
                         break
                     time.sleep(0.01)
                 assert (preview / "typing-pid").exists(), "Text insertion never started"
-                assert (preview / "typed-text").read_bytes() == b"Compl"
                 typing_pids = [
                     int((preview / "typing-pid").read_text()),
                     *map(int, (preview / "backend-pids").read_text().split()),
                 ]
+                assert (preview / "typed-text").read_bytes() == b"Compl"
                 ipc("integration", "quit")
                 process.wait(timeout=5)
                 assert (preview / "typed-text").read_bytes() == b"Compl", (
@@ -359,9 +361,11 @@ def production(env, artifacts):
                 )
                 assert not (preview / "unexpected-terminal").exists()
             finally:
+                (preview / "finish-typing").touch()
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
+                wait_exit(typing_pids, socket_removed=False)
         log = log_path.read_text()
         for error in ("ERROR", "TypeError", "ReferenceError", "Binding loop", "Unable to assign"):
             assert error not in log, f"Production QML error: {error}"
@@ -425,6 +429,9 @@ def main():
                     raise RuntimeError("QML preview did not start")
                 ipc("settings")
                 assert not json.loads(ipc("report"))["canSave"]
+                assert json.loads(ipc("report"))["statusText"] == (
+                    "Backend offline · enable the plugin or check its dependencies."
+                )
                 ipc("save")
                 assert json.loads(ipc("report"))["saved"] == {}
                 event({"type": "settings", "settings": {}})
@@ -476,7 +483,19 @@ def main():
                         )
                     report = json.loads(ipc("report"))
                     assert report["phase"] == phase, report
+                    if phase == "done":
+                        assert report["title"] == "Text inserted", report
                     capture(f"voice-{phase}")
+                event(
+                    {
+                        "type": "state",
+                        "phase": "done",
+                        "text": "",
+                        "message": "No speech recognized",
+                    }
+                )
+                assert json.loads(ipc("report"))["title"] == "No speech recognized"
+                capture("voice-no-speech")
                 long_text = (
                     "中文和 English 混合输入。 " * 100 + "最后一句必须完整可见。 END OF TRANSCRIPT."
                 )
