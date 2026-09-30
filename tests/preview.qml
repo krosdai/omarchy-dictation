@@ -6,7 +6,7 @@ import "ui"
 ShellRoot {
     VoiceState {
         id: state
-        connected: true
+        connected: false
         configured: true
         llmConfigured: true
     }
@@ -33,7 +33,16 @@ ShellRoot {
     IpcHandler {
         target: "preview"
         function event(payload: string): void {
-            state.receive(JSON.parse(payload));
+            var value = JSON.parse(payload);
+            state.receive(value);
+            if (value.type === "settings")
+                state.connected = true;
+        }
+        function edit(payload: string): void {
+            settings.loadValues(JSON.parse(payload));
+        }
+        function save(): void {
+            settings.save();
         }
         function settings(): void {
             settings.open();
@@ -47,7 +56,10 @@ ShellRoot {
                 text: state.transcript,
                 settingsOpen: settings.opened,
                 connected: state.connected,
-                saving: state.saving
+                saving: state.saving,
+                canSave: settings.canSave,
+                values: settings.formValues(),
+                saved: state.settings
             });
         }
         function quit(): void {

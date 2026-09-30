@@ -10,6 +10,8 @@ Item {
     readonly property bool settingsOpened: settings.opened
     readonly property bool voiceActive: voice.busy
     readonly property string voiceTitle: voice.title
+    readonly property var settingsForm: settings
+    readonly property bool backendRunning: backend.running
     property bool wasConnected: false
 
     function send(value) {
@@ -111,14 +113,14 @@ Item {
             onRead: function (line) {
                 try {
                     var event = JSON.parse(line);
-                    if (event.type === "settings") {
-                        voice.connected = true;
-                        root.wasConnected = true;
-                    }
                     if (event.type === "ack" && !event.accepted) {
                         settings.feedback = event.message || "Command rejected";
                     } else
                         voice.receive(event);
+                    if (event.type === "settings") {
+                        voice.connected = true;
+                        root.wasConnected = true;
+                    }
                 } catch (error) {
                     console.warn("Dictation backend returned an invalid event");
                 }

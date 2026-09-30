@@ -15,15 +15,36 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SAVED_SETTINGS = {
+    "mode": "translate",
+    "microphone": "fake-mic",
+    "base_url": "https://fixture.invalid/v1",
+    "model": "saved-asymmetric-model",
+    "reasoning_effort": "low",
+}
 
 
 def production(env, artifacts):
     """Actual service/installer/backend with fake PCM and private configuration."""
-    with tempfile.TemporaryDirectory(prefix="voice-service-") as directory:
+    with tempfile.TemporaryDirectory(prefix="voice-service-", dir=artifacts.parent) as directory:
         preview = Path(directory)
         shutil.copyfile(ROOT / "tests/service-preview.qml", preview / "shell.qml")
         for name in ("Service.qml", "Panel.qml", "BarWidget.qml", "voice.py", "install.py"):
             shutil.copyfile(ROOT / name, preview / name)
+        # Override recognition only in the disposable copy. Installer spawning,
+        # stdio EOF, output delivery, and QML Process destruction remain real.
+        shutil.copyfile(ROOT / "voice.py", preview / "fixture_voice.py")
+        (preview / "voice.py").write_text(
+            "import os,pathlib,fixture_voice as voice\n"
+            f"pathlib.Path({str(preview / 'backend-pids')!r}).write_text("
+            "f'{os.getpid()} {os.getppid()}')\n"
+            "original_run=voice.Backend.run\n"
+            "async def run(self,testing):\n"
+            " if testing: return await original_run(self,testing)\n"
+            " await self.output('Complete fixture text.', '')\n"
+            "voice.Backend.run=run\n"
+            "raise SystemExit(voice.main())\n"
+        )
         for name in ("Commons", "Ui"):
             (preview / name).symlink_to(Path("/usr/share/omarchy/shell") / name)
         (preview / "ui").symlink_to(ROOT / "ui")
@@ -34,10 +55,7 @@ def production(env, artifacts):
         for path in (config, state, runtime, tools):
             path.mkdir(parents=True)
         (runtime / "venv").symlink_to(Path(sys.prefix))
-        for name in ("api_key", "elevenlabs_api_key"):
-            (config / name).write_text("fake-never-uploaded\n")
-            (config / name).chmod(0o600)
-        (config / "settings.json").write_text('{"mode":"translate"}')
+        (config / "settings.json").write_text(json.dumps(SAVED_SETTINGS))
         nodes = [
             {
                 "id": 9,
@@ -67,6 +85,16 @@ def production(env, artifacts):
         }
         for name in ("wtype", "wl-copy", "wl-paste", "curl", "jq", "notify-send"):
             scripts[name] = "#!/bin/sh\nexit 0\n"
+        scripts["wtype"] = (
+            f"#!{sys.executable}\nimport os,sys,time,pathlib\n"
+            "text=sys.stdin.buffer.read()\n"
+            "if text:\n"
+            f" typed=pathlib.Path({str(preview / 'typed-text')!r})\n"
+            " typed.write_bytes(text[:5])\n"
+            f" pathlib.Path({str(preview / 'typing-pid')!r}).write_text(str(os.getpid()))\n"
+            " time.sleep(1.5)\n"
+            " typed.write_bytes(text)\n"
+        )
         for name, script in scripts.items():
             (tools / name).write_text(script)
             (tools / name).chmod(0o755)
@@ -111,6 +139,16 @@ def production(env, artifacts):
                     time.sleep(0.1)
                 raise AssertionError(f"Production service never reached {phase}")
 
+            def wait_exit(pids):
+                for _ in range(50):
+                    if all(not Path(f"/proc/{pid}").exists() for pid in pids):
+                        break
+                    time.sleep(0.1)
+                assert all(not Path(f"/proc/{pid}").exists() for pid in pids), pids
+                assert not (
+                    Path(env["XDG_RUNTIME_DIR"]) / "omarchy-dictation/control.sock"
+                ).exists()
+
             try:
                 # First-run setup is stubbed, not a real terminal/desktop mutation.
                 for _ in range(50):
@@ -124,12 +162,85 @@ def production(env, artifacts):
                 time.sleep(0.3)
                 report = json.loads(ipc("dictation", "status"))
                 assert report["phase"] == "error" and not report["connected"]
-                # Completing setup must revive the backend without a shell restart.
-                (state / "installed.json").write_text('{"version":"0.2.0"}')
+                ipc("integration", "panel")
+                report = json.loads(ipc("integration", "report"))
+                assert report["panelOpen"] and not report["canSave"]
+                ipc("integration", "save")
+                assert json.loads((config / "settings.json").read_text()) == SAVED_SETTINGS
+                subprocess.run(
+                    ["grim", str(artifacts / "voice-production-offline.png")], env=env, check=True
+                )
+                # An existing installation with missing keys is still offline.
+                marker = state / "installed.json"
+                marker_bytes = '{"version":"0.2.0","preserved":"fixture"}'
+                marker.write_text(marker_bytes)
+                time.sleep(0.5)
+                assert not json.loads(ipc("dictation", "status"))["connected"]
+                assert not json.loads(ipc("integration", "report"))["canSave"]
+                subprocess.run(
+                    ["grim", str(artifacts / "voice-production-missing-credentials.png")],
+                    env=env,
+                    check=True,
+                )
+                # The detached credentials launcher returns before either key
+                # exists. Its exit alone must not be mistaken for recovery.
+                ipc("integration", "credentials")
+                for _ in range(50):
+                    if (preview / "unexpected-terminal").exists():
+                        break
+                    time.sleep(0.1)
+                assert (preview / "unexpected-terminal").exists()
+                (preview / "unexpected-terminal").unlink()
+                time.sleep(0.2)
+                ipc("integration", "panel")
+                assert not json.loads(ipc("integration", "report"))["canSave"]
+                for _ in range(50):
+                    if not json.loads(ipc("integration", "report"))["backendRunning"]:
+                        break
+                    time.sleep(0.1)
+                assert not json.loads(ipc("integration", "report"))["backendRunning"]
+                for name in ("api_key", "elevenlabs_api_key"):
+                    (config / name).write_text("fake-never-uploaded\n")
+                    (config / name).chmod(0o600)
+                time.sleep(0.2)
+                assert not json.loads(ipc("dictation", "status"))["connected"]
+                # Simulate the installer's atomic, unchanged repair notification.
+                replacement = state / "marker-replacement"
+                replacement.write_text(marker_bytes)
+                replacement.replace(marker)
                 wait_phase("idle")
+                assert marker.read_text() == marker_bytes
+                report = json.loads(ipc("integration", "report"))
+                assert report["panelOpen"] and report["canSave"]
+                assert report["values"] == SAVED_SETTINGS, report
+                time.sleep(0.25)
+                subprocess.run(
+                    ["grim", str(artifacts / "voice-production-recovered.png")], env=env, check=True
+                )
+                ipc("integration", "save")
+                time.sleep(0.3)
+                saved = json.loads((config / "settings.json").read_text())
+                assert {key: saved[key] for key in SAVED_SETTINGS} == SAVED_SETTINGS
+                subprocess.run(
+                    ["grim", str(artifacts / "voice-production-saved-settings.png")],
+                    env=env,
+                    check=True,
+                )
+                # Edit the open form, then refresh unrelated backend settings.
+                edited = SAVED_SETTINGS | {"model": "edited-model", "reasoning_effort": None}
+                ipc("integration", "edit", json.dumps(edited))
+                ipc("integration", "refresh")
+                time.sleep(0.3)
+                assert json.loads(ipc("integration", "report"))["values"] == edited
+                ipc("integration", "save")
+                for _ in range(50):
+                    saved = json.loads((config / "settings.json").read_text())
+                    if saved.get("model") == "edited-model":
+                        break
+                    time.sleep(0.1)
+                assert {key: saved[key] for key in edited} == edited
                 ipc("dictation", "cancel")
                 wait_phase("idle")
-                ipc("integration", "panel")
                 assert json.loads(ipc("integration", "report"))["widgetOpen"]
                 time.sleep(0.3)
                 subprocess.run(
@@ -141,13 +252,6 @@ def production(env, artifacts):
                 ipc("integration", "widget")
                 assert json.loads(ipc("integration", "report"))["panelOpen"]
                 ipc("dictation", "close")
-                ipc("integration", "configure", '{"mode":"rephrase","model":"fixture-model"}')
-                for _ in range(50):
-                    saved = json.loads((config / "settings.json").read_text())
-                    if saved.get("model") == "fixture-model":
-                        break
-                    time.sleep(0.1)
-                assert saved["mode"] == "rephrase" and saved["model"] == "fixture-model"
                 ipc("integration", "test")
                 wait_phase("testing")
                 time.sleep(0.5)
@@ -157,13 +261,49 @@ def production(env, artifacts):
                     check=True,
                 )
                 pid = int((preview / "recorder-pid").read_text())
+                capture_pids = [pid, *map(int, (preview / "backend-pids").read_text().split())]
                 ipc("integration", "quit")
                 process.wait(timeout=5)
-                for _ in range(50):
-                    if not Path(f"/proc/{pid}").exists():
+                wait_exit(capture_pids)
+                # Reload the actual service and destroy its QML during insertion.
+                process = subprocess.Popen(
+                    ["quickshell", "-p", str(preview), "--no-color"],
+                    env=env,
+                    stdout=log,
+                    stderr=log,
+                )
+                wait_phase("idle")
+                ipc("integration", "start")
+                for _ in range(100):
+                    if (preview / "typing-pid").exists():
                         break
-                    time.sleep(0.1)
-                assert not Path(f"/proc/{pid}").exists(), "Unloading must stop the recorder"
+                    time.sleep(0.01)
+                assert (preview / "typing-pid").exists(), "Text insertion never started"
+                assert (preview / "typed-text").read_bytes() == b"Compl"
+                typing_pids = [
+                    int((preview / "typing-pid").read_text()),
+                    *map(int, (preview / "backend-pids").read_text().split()),
+                ]
+                ipc("integration", "quit")
+                process.wait(timeout=5)
+                assert (preview / "typed-text").read_bytes() == b"Compl", (
+                    "QML must finish destruction while insertion is still partial"
+                )
+                wait_exit(typing_pids)
+                assert (preview / "typed-text").read_bytes() == b"Complete fixture text."
+                (artifacts / "service-shutdown.json").write_text(
+                    json.dumps(
+                        {
+                            "capture_pids_reaped": capture_pids,
+                            "typing_pids_exited": typing_pids,
+                            "partial_at_unload": "Compl",
+                            "final_text": (preview / "typed-text").read_text(),
+                            "socket_removed": True,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
                 assert not (preview / "unexpected-terminal").exists()
             finally:
                 if process.poll() is None:
@@ -172,7 +312,10 @@ def production(env, artifacts):
         log = log_path.read_text()
         for error in ("ERROR", "TypeError", "ReferenceError", "Binding loop", "Unable to assign"):
             assert error not in log, f"Production QML error: {error}"
-    print("Production service, own-service panel/widget, settings, PCM and shutdown passed.")
+    print(
+        "Production service: offline form, missing keys, atomic repair, form persistence, "
+        "panel/widget, fixture PCM reaping and complete typing during QML destruction passed."
+    )
 
 
 def main():
@@ -182,7 +325,7 @@ def main():
     args.artifacts.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "QT_QPA_PLATFORM": "wayland", "QT_QUICK_BACKEND": "software"}
     env.pop("WAYLAND_DEBUG", None)
-    with tempfile.TemporaryDirectory(prefix="voice-ui-") as directory:
+    with tempfile.TemporaryDirectory(prefix="voice-ui-", dir=args.artifacts.parent) as directory:
         preview = Path(directory)
         shutil.copyfile(ROOT / "tests/preview.qml", preview / "shell.qml")
         for name in ("Commons", "Ui"):
@@ -226,6 +369,25 @@ def main():
                         time.sleep(0.1)
                 else:
                     raise RuntimeError("QML preview did not start")
+                ipc("settings")
+                assert not json.loads(ipc("report"))["canSave"]
+                ipc("save")
+                assert json.loads(ipc("report"))["saved"] == {}
+                event({"type": "settings", "settings": {}})
+                assert json.loads(ipc("report"))["connected"]
+                assert not json.loads(ipc("report"))["canSave"]
+                ipc("save")
+                assert json.loads(ipc("report"))["saved"] == {}
+                event({"type": "settings", "settings": SAVED_SETTINGS})
+                report = json.loads(ipc("report"))
+                assert report["canSave"] and report["values"] == SAVED_SETTINGS
+                edited = SAVED_SETTINGS | {"model": "unsaved-local-edit"}
+                ipc("edit", json.dumps(edited))
+                event({"type": "settings", "settings": SAVED_SETTINGS})
+                assert json.loads(ipc("report"))["values"] == edited
+                ipc("save")
+                assert json.loads(ipc("report"))["saved"] == edited
+                ipc("close")
                 for phase in (
                     "connecting",
                     "listening",
@@ -301,7 +463,10 @@ def main():
     assert "set_input_region" in log
     for error in ("ERROR", "TypeError", "ReferenceError", "Binding loop", "Unable to assign"):
         assert error not in log, f"QML error: {error}"
-    print("UI states, preview replacement, Escape, and Wayland input policies passed.")
+    print(
+        "UI settings initialization/edit preservation, states, preview replacement, "
+        "Escape, and Wayland input policies passed."
+    )
     production(env, args.artifacts)
 
 

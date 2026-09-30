@@ -50,16 +50,34 @@ ShellRoot {
                 command: "test"
             });
         }
+        function start(): void {
+            service.send({ command: "start" });
+        }
         function configure(payload: string): void {
             service.send({
                 command: "configure",
                 settings: JSON.parse(payload)
             });
         }
+        function save(): void {
+            service.settingsForm.save();
+        }
+        function edit(payload: string): void {
+            service.settingsForm.loadValues(JSON.parse(payload));
+        }
+        function refresh(): void {
+            service.send({ command: "settings" });
+        }
+        function credentials(): void {
+            service.settingsForm.credentialsRequested();
+        }
         function report(): string {
             return JSON.stringify({
                 panelOpen: panelEntry.opened,
-                widgetOpen: widgetEntry.opened
+                widgetOpen: widgetEntry.opened,
+                canSave: service.settingsForm.canSave,
+                backendRunning: service.backendRunning,
+                values: service.settingsForm.formValues()
             });
         }
         function quit(): void {

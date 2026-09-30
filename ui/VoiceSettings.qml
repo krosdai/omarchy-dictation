@@ -12,6 +12,8 @@ PanelWindow {
     property bool opened: false
     property string feedback: ""
     property var targetScreen: null
+    property bool valuesReady: false
+    readonly property bool canSave: valuesReady && state.connected && !state.saving && !state.busy
     signal saveRequested(var settings)
     signal credentialsRequested
     signal testRequested(string microphone)
@@ -32,13 +34,33 @@ PanelWindow {
         item: card
     }
 
-    function open() {
-        var s = state.settings;
+    function loadValues(s) {
         mode.value = s.mode || "rephrase";
         microphone.value = s.microphone || "auto";
         provider.text = s.base_url || "https://api.cerebras.ai/v1";
         model.text = s.model || "qwen-3.8-27b";
         effort.text = s.reasoning_effort || "";
+    }
+    function formValues() {
+        return {
+            mode: mode.value,
+            microphone: microphone.value,
+            base_url: provider.text.trim(),
+            model: model.text.trim(),
+            reasoning_effort: effort.text.trim() || null
+        };
+    }
+    function save() {
+        if (!canSave)
+            return;
+        feedback = "";
+        state.message = "";
+        state.saving = true;
+        saveRequested(formValues());
+    }
+    function open() {
+        valuesReady = state.connected && Object.keys(state.settings).length > 0;
+        loadValues(valuesReady ? state.settings : {});
         feedback = "";
         opened = true;
         Qt.callLater(function () {
@@ -54,6 +76,18 @@ PanelWindow {
 
     Connections {
         target: root.state
+        function onConnectedChanged() {
+            if (!root.state.connected)
+                root.valuesReady = false;
+        }
+        function onSettingsChanged() {
+            // Initialize a waiting form once; later device/settings events must
+            // not replace edits made during this opening.
+            if (root.opened && !root.valuesReady && Object.keys(root.state.settings).length > 0) {
+                root.loadValues(root.state.settings);
+                root.valuesReady = true;
+            }
+        }
         function onSavingChanged() {
             if (!root.state.saving && root.opened)
                 root.feedback = root.state.message || "Settings saved";
@@ -243,20 +277,9 @@ PanelWindow {
                         text: root.state.saving ? "Saving…" : "Save settings"
                         focusable: true
                         bordered: true
-                        enabled: root.state.connected && !root.state.saving && !root.state.busy
+                        enabled: root.canSave
                         opacity: enabled ? 1 : 0.4
-                        onClicked: {
-                            root.feedback = "";
-                            root.state.message = "";
-                            root.state.saving = true;
-                            root.saveRequested({
-                                mode: mode.value,
-                                microphone: microphone.value,
-                                base_url: provider.text.trim(),
-                                model: model.text.trim(),
-                                reasoning_effort: effort.text.trim() || null
-                            });
-                        }
+                        onClicked: root.save()
                     }
                 }
             }
