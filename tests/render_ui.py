@@ -39,6 +39,11 @@ def production(env, artifacts):
             f"pathlib.Path({str(preview / 'backend-pids')!r}).write_text("
             "f'{os.getpid()} {os.getppid()}')\n"
             "original_run=voice.Backend.run\n"
+            "original_execute=voice.execute\n"
+            "async def execute(args,data=None,**kwargs):\n"
+            " if args[0]=='wtype' and data: kwargs['timeout']=30\n"
+            " return await original_execute(args,data,**kwargs)\n"
+            "voice.execute=execute\n"
             "async def run(self,testing):\n"
             " if testing: return await original_run(self,testing)\n"
             " await self.output('Complete fixture text.', '')\n"
@@ -92,7 +97,13 @@ def production(env, artifacts):
             f" typed=pathlib.Path({str(preview / 'typed-text')!r})\n"
             " typed.write_bytes(text[:5])\n"
             f" pathlib.Path({str(preview / 'typing-pid')!r}).write_text(str(os.getpid()))\n"
-            " time.sleep(3)\n"
+            # Hold the singleton collision window until the new service has
+            # actually observed it, not for a machine-speed-dependent delay.
+            f" release=pathlib.Path({str(preview / 'finish-typing')!r})\n"
+            " deadline=time.monotonic()+30\n"
+            " while not release.exists():\n"
+            "  if time.monotonic()>=deadline: raise SystemExit('Fixture gate timed out')\n"
+            "  time.sleep(.01)\n"
             " typed.write_bytes(text)\n"
         )
         for name, script in scripts.items():
@@ -318,6 +329,7 @@ def production(env, artifacts):
                     raise AssertionError("Reload did not encounter the old daemon's lock")
                 assert (preview / "typed-text").read_bytes() == b"Compl"
                 assert not json.loads(ipc("integration", "report"))["backendRunning"]
+                (preview / "finish-typing").touch()
                 wait_exit(typing_pids, socket_removed=False)
                 assert (preview / "typed-text").read_bytes() == b"Complete fixture text."
                 wait_phase("idle")
