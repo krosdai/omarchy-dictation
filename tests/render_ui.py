@@ -486,15 +486,12 @@ def main():
                     if phase == "done":
                         assert report["title"] == "Text inserted", report
                     capture(f"voice-{phase}")
-                event(
-                    {
-                        "type": "state",
-                        "phase": "done",
-                        "text": "",
-                        "message": "No speech recognized",
-                    }
-                )
-                assert json.loads(ipc("report"))["title"] == "No speech recognized"
+                event({"type": "state", "phase": "listening", "text": "Discarded draft"})
+                assert json.loads(ipc("report"))["hudVisible"]
+                event({"type": "preview", "text": ""})
+                event({"type": "state", "phase": "idle"})
+                report = json.loads(ipc("report"))
+                assert not report["hudVisible"] and report["text"] == "", report
                 capture("voice-no-speech")
                 long_text = (
                     "中文和 English 混合输入。 " * 100 + "最后一句必须完整可见。 END OF TRANSCRIPT."

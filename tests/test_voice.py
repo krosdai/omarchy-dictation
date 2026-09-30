@@ -87,6 +87,25 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         result, _, _ = await self.session(handler, packets(b"\0" * voice.SEGMENT_BYTES))
         self.assertEqual(result, "Boundary.")
 
+    async def test_empty_audio_and_silent_commit_return_no_transcript(self):
+        for chunks in ((), (b"\0" * 3200,)):
+            with self.subTest(has_pcm=bool(chunks)):
+
+                async def handler(socket):
+                    await event(socket, "session_started")
+                    if chunks:
+                        pcm = json.loads(await socket.recv())
+                        self.assertFalse(pcm["commit"])
+                        await event(socket, "partial_transcript", "Discarded draft")
+                        final = json.loads(await socket.recv())
+                        self.assertTrue(final["commit"])
+                        await event(socket, "committed_transcript", " \n ")
+                    await socket.wait_closed()
+
+                result, _, ready = await self.session(handler, packets(*chunks))
+                self.assertEqual(result, "")
+                ready.assert_awaited_once()
+
     async def test_preview_is_revisable_and_only_commit_is_final(self):
         async def handler(socket):
             await event(socket, "session_started")
@@ -330,6 +349,33 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             await self.backend.cancel()
             output.assert_not_awaited()
         self.assertEqual(self.backend.preview["text"], "")
+
+    async def test_no_speech_returns_to_idle_without_cleanup_output_or_notice(self):
+        (self.config / "elevenlabs_api_key").write_text("fake")
+
+        async def no_speech(audio, key, emit, ready):
+            await ready()
+            await emit({"type": "preview", "text": "Discarded draft"})
+            return ""
+
+        with (
+            patch("voice.recognize", side_effect=no_speech),
+            patch("voice.execute", AsyncMock()) as cleanup,
+            patch.object(self.backend, "output", AsyncMock()) as output,
+        ):
+            await self.backend.command({"command": "start"})
+            await self.backend.task
+            cleanup.assert_not_awaited()
+            output.assert_not_awaited()
+        self.assertEqual(self.backend.state["phase"], "idle")
+        self.assertEqual(self.backend.state["text"], "")
+        self.assertEqual(self.backend.state["message"], "")
+        self.assertEqual(self.backend.preview["text"], "")
+        self.assertFalse(self.backend.busy)
+        self.assertTrue(self.backend.capture.closed)
+        self.assertFalse(
+            any(e.get("phase") in ("processing", "done", "error") for e in self.events)
+        )
 
     async def test_asr_failure_never_outputs_partial(self):
         (self.config / "elevenlabs_api_key").write_text("fake")
