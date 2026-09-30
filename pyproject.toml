@@ -1,9 +1,9 @@
 [project]
 name = "omarchy-dictation"
-version = "0.1.0"
-description = "Omarchy plugin: hold-to-dictate with Voxtype and LLM cleanup via any OpenAI-compatible API"
+version = "0.2.0"
+description = "Standalone Omarchy voice input with live waveforms, Scribe recognition and LLM cleanup"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["websockets==15.0.1"]
 
 [tool.ruff]
 line-length = 100

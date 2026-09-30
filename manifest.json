@@ -1,10 +1,14 @@
 {
   "schemaVersion": 1,
   "id": "krosdai.dictation",
-  "name": "Dictation Cleanup",
-  "version": "0.1.0",
+  "name": "Voice Input",
+  "version": "0.2.0",
   "author": "Krosdai",
-  "description": "Hold a key to dictate with Voxtype and have the transcript cleaned up in your language or rendered as English; press another key to rewrite the clipboard text as native English. Works with any OpenAI-compatible LLM API (Cerebras by default).",
-  "kinds": ["service"],
-  "entryPoints": { "service": "Service.qml" }
+  "description": "Standalone PipeWire voice input with live waveforms and subtitles, ElevenLabs Scribe recognition, and OpenAI-compatible cleanup, translation and clipboard polishing. No Voxtype required.",
+  "kinds": ["service", "panel", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "panel": "Panel.qml",
+    "barWidget": "BarWidget.qml"
+  }
 }

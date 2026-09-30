@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Text rewriting via any OpenAI-compatible Chat Completions API.
 #
-# Reads text on stdin and prints the rewritten text on stdout. Mode comes from
-# the program name (voxtype-rephrase / voxtype-translate-en, both symlinks to
-# this file) or from --mode.
+# Reads text on stdin and prints the rewritten text on stdout. Select --mode.
 #
 #   rephrase   clean up a dictation in the language it was spoken in
 #   translate  render a dictation as native English
@@ -12,27 +10,27 @@
 # Prompt-injection hardening: the input is sent as delimited untrusted data,
 # the model must answer with a strict JSON object {"text": ...}, and the result
 # is sanity-checked. On any failure the original text is printed unchanged so
-# Voxtype always types something; with --strict nothing is printed and the exit
+# the caller can preserve dictation; with --strict nothing is printed and the exit
 # status is 1 instead, for callers that must not mistake the input for a result.
 #
 # Provider: base_url, model and reasoning_effort in
 # ~/.config/omarchy-dictation/settings.json (Cerebras by default), read on every
 # call. The key is in ~/.config/omarchy-dictation/api_key.
-# Env overrides: VOXTYPE_LLM_API_KEY, VOXTYPE_LLM_API_KEY_FILE, VOXTYPE_LLM_BASE_URL,
-#                VOXTYPE_LLM_MODEL, VOXTYPE_LLM_SETTINGS_FILE, VOXTYPE_VOCABULARY_FILE.
+# Env overrides: DICTATION_LLM_API_KEY, DICTATION_LLM_API_KEY_FILE, DICTATION_LLM_BASE_URL,
+#                DICTATION_LLM_MODEL, DICTATION_LLM_SETTINGS_FILE, DICTATION_VOCABULARY_FILE.
 # Needs: bash 4+, curl, jq 1.7+.
 set -uo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-dictation"
-SETTINGS_FILE="${VOXTYPE_LLM_SETTINGS_FILE:-$CONFIG_DIR/settings.json}"
-KEY_FILE="${VOXTYPE_LLM_API_KEY_FILE:-$CONFIG_DIR/api_key}"
-VOCAB_FILE="${VOXTYPE_VOCABULARY_FILE:-$HOME/.config/voxtype/vocabulary.txt}"
+SETTINGS_FILE="${DICTATION_LLM_SETTINGS_FILE:-$CONFIG_DIR/settings.json}"
+KEY_FILE="${DICTATION_LLM_API_KEY_FILE:-$CONFIG_DIR/api_key}"
+VOCAB_FILE="${DICTATION_VOCABULARY_FILE:-$CONFIG_DIR/vocabulary.txt}"
 # Keep in sync with DEFAULT_SETTINGS in install.py.
 DEFAULT_BASE_URL="https://api.cerebras.ai/v1"
 DEFAULT_MODEL="qwen-3.8-27b"
 DEFAULT_REASONING_EFFORT="none"
 
-log() { printf 'voxtype-llm: %s\n' "$*" >&2; }
+log() { printf 'dictation-llm: %s\n' "$*" >&2; }
 usage() { printf 'usage: %s [--mode rephrase|translate|polish] [--strict] < text\n' "${0##*/}"; }
 
 # ---------------------------------------------------------------- arguments
@@ -48,14 +46,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-if [ -z "$mode" ]; then
-  case "${0##*/}" in
-    voxtype-rephrase) mode=rephrase ;;
-    voxtype-translate-en) mode=translate ;;
-  esac
-fi
-
-# Per-mode limits. Dictations are short and Voxtype gives up after 20 s; a
+# Per-mode limits. Dictations are short and the backend gives up after 20 s; a
 # polished document can be long, and Chinese-to-English roughly quadruples the
 # character count.
 case "$mode" in
@@ -63,7 +54,7 @@ case "$mode" in
     tag=transcript; request_timeout_s=15; max_tokens=2048; max_growth=3 ;;
   polish)
     tag=draft; request_timeout_s=90; max_tokens=16384; max_growth=6 ;;
-  *) log "error: --mode rephrase|translate|polish is required when not invoked as voxtype-rephrase / voxtype-translate-en"; exit 2 ;;
+  *) log "error: --mode rephrase|translate|polish is required"; exit 2 ;;
 esac
 
 # ---------------------------------------------------------------- input
@@ -97,8 +88,8 @@ if [ -e "$SETTINGS_FILE" ]; then
   mapfile -t fields <<<"$provider"
   base_url="${fields[0]:-}"; model="${fields[1]:-}"; reasoning_effort="${fields[2]:-}"
 fi
-base_url="${VOXTYPE_LLM_BASE_URL:-$base_url}"
-model="${VOXTYPE_LLM_MODEL:-$model}"
+base_url="${DICTATION_LLM_BASE_URL:-$base_url}"
+model="${DICTATION_LLM_MODEL:-$model}"
 # Dictated text must not cross the network in the clear. Judge the host curl will
 # actually contact: no user info, query or fragment; scheme and host ignore case.
 url_is_safe() {  # $1 = URL
@@ -124,7 +115,7 @@ curl_local=()
 ENDPOINT="${base_url%/}/chat/completions"
 
 # ---------------------------------------------------------------- key
-key="${VOXTYPE_LLM_API_KEY:-}"
+key="${DICTATION_LLM_API_KEY:-}"
 if [ -z "$key" ] && [ -r "$KEY_FILE" ]; then
   key="$(tr -d '[:space:]' < "$KEY_FILE")"
 fi
@@ -200,7 +191,7 @@ build_body() {  # $1 = "full" | "minimal"
 }
 
 # Returns the HTTP status in $status and the body in $response. All attempts share
-# one time budget so a retry cannot outlast Voxtype's post-processing timeout.
+# one time budget so a retry cannot outlast the post-processing timeout.
 deadline=$((SECONDS + request_timeout_s))
 call_api() {  # $1 = body
   local raw remaining=$((deadline - SECONDS))
@@ -210,7 +201,7 @@ call_api() {  # $1 = body
     -H "Authorization: Bearer $key" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json" \
-    -A "voxtype-llm/1.1" \
+    -A "omarchy-dictation/0.2" \
     --data-binary "$1" "$ENDPOINT")" || return 1
   status="${raw##*$'\n'}"
   response="${raw%$'\n'*}"

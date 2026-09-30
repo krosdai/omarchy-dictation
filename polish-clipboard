@@ -3,14 +3,14 @@
 # paragraph and Markdown structure, and put the result back in the clipboard.
 # Meant for a key binding: copy a draft, press the key, paste the polished text.
 #
-# Uses `voxtype-llm --mode polish --strict` (same directory or PATH), so the
+# Uses `dictation-llm --mode polish --strict` (same directory or PATH), so the
 # clipboard is only replaced when the rewrite actually succeeded. Progress and
 # errors are shown with notify-send.
 set -uo pipefail
 
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-llm="$here/voxtype-llm"
-[ -x "$llm" ] || llm="voxtype-llm"
+llm="$here/dictation-llm"
+[ -x "$llm" ] || llm="dictation-llm"
 
 app="Polish clipboard"
 notify_id=""
@@ -42,7 +42,7 @@ notify low "Polishing…" "$(escape "${input:0:120}")" 90000
 errors="$work/errors"
 if ! output="$(printf '%s' "$input" | "$llm" --mode polish --strict 2>"$errors")"; then
   reason="$(tail -n 1 "$errors")"
-  notify critical "Polish failed" "$(escape "${reason#voxtype-llm: }")"
+  notify critical "Polish failed" "$(escape "${reason#dictation-llm: }")"
   exit 1
 fi
 
