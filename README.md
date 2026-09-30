@@ -53,6 +53,8 @@ for confirmation. Setup creates private credentials, a Python runtime and comman
 launchers, then backs up and adds managed bindings to `~/.config/hypr/bindings.lua`.
 It reloads Hyprland and checks for configuration errors. A failed reload restores
 the previous bindings and launchers. Credentials and the runtime are retained.
+Setup refuses to overwrite a personal command or a modified plugin launcher;
+move the conflicting command yourself before retrying.
 
 The default dictation key is the Copilot key (`F23`); modifier spellings are included
 for different keyboard layouts. If you use another key, edit the settings below.
@@ -71,8 +73,9 @@ To run setup directly, use the `install.py` in your registered checkout:
 
 ### Upgrading from the Voxtype-based version
 
-Setup removes only this plugin's old managed TOML profiles and copies your old
-Voxtype vocabulary if the new vocabulary does not exist. It does **not** stop,
+Setup removes this plugin's old managed TOML profiles and unchanged legacy commands,
+and copies your old Voxtype vocabulary if the new vocabulary does not exist.
+Modified legacy scripts and unproven symlinks are preserved. It does **not** stop,
 uninstall or reconfigure Voxtype beyond those owned profiles. Disable any legacy
 dictation service or remove overlapping personal hotkeys before using the new
 plugin; two recorders must not own the same key. The installer never starts or
@@ -151,7 +154,8 @@ change the audio sent to the recognizer.
   already be partial, and retrying could duplicate it.
 - Clipboard-polish failure leaves the clipboard unchanged.
 - Disabling/unloading the service closes its command stream, stops capture and
-  reaps its child processes. Hotkey launchers remain until explicit uninstall.
+  reaps its child processes. Text delivery already in progress finishes within
+  its timeout rather than being interrupted. Hotkey launchers remain until uninstall.
 - Audio is streamed, not saved locally. Transcripts remain in memory/UI, not in
   a local history file. Provider-side retention is controlled by your providers.
 - Keys never enter QML, IPC messages or command arguments. Cleanup treats dictated

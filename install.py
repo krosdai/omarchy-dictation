@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,13 @@ SCRIPT = "dictation-llm"
 WRAPPER = "polish-clipboard"
 LAUNCHER = "omarchy-dictation"
 COMMANDS = (LAUNCHER, SCRIPT, WRAPPER)
+# Exact copied payloads from the v0.1.0 installer at 610ae09; names alone
+# cannot establish ownership. That installer used relative voxtype-llm symlinks.
+LEGACY_HASHES = {
+    "voxtype-llm": "a7690de1c4dbdf170e0d1139c2dd0f9878c49abfb81390da655caa88696789c3",
+    WRAPPER: "cfa35eaa42c14686314051eec06bd789a7328d0be7ec660518fadc3ec485e66b",
+}
+LEGACY_LINKS = ("voxtype-rephrase", "voxtype-translate-en")
 REQUIRED_TOOLS = (
     "pw-record",
     "wpctl",
@@ -194,18 +202,33 @@ o.bind({chord}, "Polish clipboard text into English", {wrapper})
 -- Managed by the {ID} Omarchy plugin; edit settings.json instead.
 -- Hold a chord to dictate; the transcript is cleaned up in the language spoken.
 -- Hold {settings["translate_key"]} as well to render it as English instead.
+local dictation_key, dictation_operation
+local dictation_sequence = 0
+local dictation_uuid = assert(io.open("/proc/sys/kernel/random/uuid", "r"))
+local dictation_session = dictation_uuid:read("*l")
+dictation_uuid:close()
 for _, chord in ipairs({{ {chords} }}) do
+  local physical_key = chord:match("([^+ ]+)$")
   hl.bind(chord, function()
+    if dictation_key then return end
+    dictation_sequence = dictation_sequence + 1
+    dictation_key = physical_key
+    dictation_operation = dictation_session .. "-" .. tostring(dictation_sequence)
     if hl.is_key_down({translate_key}) then
-      hl.exec_cmd({translate})
+      hl.exec_cmd({translate} .. " --operation " .. dictation_operation)
     else
-      hl.exec_cmd({start})
+      hl.exec_cmd({start} .. " --operation " .. dictation_operation)
     end
   end, {{ description = "Dictate while held ({settings["translate_key"]}: translate to English)" }})
 end
 -- Release by physical key with any modifiers: modifiers can change while held.
 for _, key in ipairs({{ {release_keys} }}) do
-  hl.bind(key, function() hl.exec_cmd({stop}) end,
+  hl.bind(key, function()
+    if dictation_key ~= key then return end
+    local operation = dictation_operation
+    dictation_key, dictation_operation = nil, nil
+    hl.exec_cmd({stop} .. " --operation " .. operation)
+  end,
     {{ release = true, transparent = true, ignore_mods = true }})
 end
 -- No native predicate binding is required: cancel is a backend no-op when idle.
@@ -290,11 +313,12 @@ def install_files(source, paths):
         atomic_write(paths.vocabulary, vocabulary.read_text(), 0o600)
 
 
-def remove_files(paths, marker):
-    # Personal replacements of our launchers are not ours to remove.
+def owned_commands(paths, marker):
+    """Recognize intact recorded launchers and exact historical copied files."""
+    owned = set()
     commands = marker.get("commands", {})
     if not isinstance(commands, dict):
-        return
+        commands = {}
     for name, installed in commands.items():
         if name not in COMMANDS:
             continue
@@ -305,7 +329,35 @@ def remove_files(paths, marker):
             and path.is_file()
             and path.read_bytes() == installed.encode()
         ):
-            path.unlink()
+            owned.add(name)
+    for name, digest in LEGACY_HASHES.items():
+        path = paths.bin_dir / name
+        if (
+            not path.is_symlink()
+            and path.is_file()
+            and hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        ):
+            owned.add(name)
+    if "voxtype-llm" in owned:
+        for name in LEGACY_LINKS:
+            path = paths.bin_dir / name
+            if path.is_symlink() and os.readlink(path) == "voxtype-llm":
+                owned.add(name)
+    return owned
+
+
+def check_command_collisions(paths):
+    owned = owned_commands(paths, read_marker(paths))
+    for name in COMMANDS:
+        path = paths.bin_dir / name
+        if (path.exists() or path.is_symlink()) and name not in owned:
+            raise ValueError(f"Refusing to overwrite unowned command: {path}")
+    return owned
+
+
+def remove_files(paths, marker):
+    for name in owned_commands(paths, marker):
+        (paths.bin_dir / name).unlink()
 
 
 def ensure_api_key(path, host, prompt=getpass.getpass, replace=False):
@@ -396,10 +448,15 @@ def run_daemon(source, paths):
     error = runtime_error(source, paths)
     if not error:
         try:
-            os.execv(
-                str(paths.runtime),
+            # Quickshell kills its direct child on QML destruction. Keep a
+            # wait-only parent so the backend receives stdin EOF instead and
+            # can reap capture or finish bounded irreversible text delivery.
+            process = subprocess.Popen(
                 [str(paths.runtime), str(source / "voice.py"), "daemon", "--stdio"],
+                start_new_session=True,
             )
+            process.wait()
+            return
         except OSError:
             error = "Cannot launch the private runtime; run setup again."
     if error:
@@ -420,6 +477,8 @@ def run_daemon(source, paths):
 # ----------------------------------------------------------------- apply
 def apply(source, paths, remove=False, prompt=getpass.getpass):
     # Uninstall must remain possible even with invalid user settings.
+    previous_marker = read_marker(paths)
+    owned = owned_commands(paths, previous_marker) if remove else check_command_collisions(paths)
     settings = dict(DEFAULT_SETTINGS) if remove else load_settings(paths.settings)
     source = source.resolve()
     bindings_original = paths.bindings.read_text()
@@ -449,11 +508,10 @@ def apply(source, paths, remove=False, prompt=getpass.getpass):
         atomic_write(backup / "config.toml", legacy_original)
     print(f"Backup: {backup}", flush=True)
     marker = paths.state / "installed.json"
-    previous_marker = read_marker(paths)
     # Save regular files and symlink targets, including previously owned commands.
     snapshots = {}
     for path in [
-        *(paths.bin_dir / name for name in COMMANDS),
+        *(paths.bin_dir / name for name in sorted(owned | (set() if remove else set(COMMANDS)))),
         marker,
         paths.settings,
         paths.vocabulary,
@@ -469,9 +527,8 @@ def apply(source, paths, remove=False, prompt=getpass.getpass):
         else:
             snapshots[path] = ("missing", None, None)
     try:
-        if remove:
-            remove_files(paths, previous_marker)
-        else:
+        remove_files(paths, previous_marker)
+        if not remove:
             install_files(source, paths)
         if legacy_updated != legacy_original:
             atomic_write(paths.voxtype_config, legacy_updated)
@@ -546,8 +603,13 @@ def main():
         settings = load_settings(paths.settings)
         ensure_api_key(paths.api_key, api_host(settings), replace=True)
         ensure_api_key(paths.elevenlabs_api_key, "ElevenLabs recognition", replace=True)
+        marker = paths.state / "installed.json"
+        if marker.is_file() and not marker.is_symlink():
+            atomic_write(marker, marker.read_bytes())
         print("Private credentials updated.")
         return
+    if not args.uninstall:
+        check_command_collisions(paths)
     preflight(paths, remove=args.uninstall)
     paths.state.mkdir(parents=True, exist_ok=True)
     with (paths.state / "install.lock").open("w") as lock:

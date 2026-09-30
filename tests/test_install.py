@@ -155,7 +155,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('hl.is_key_down("Alt_R")', bindings)
         self.assertNotIn("polish-clipboard", bindings)
         self.assertNotIn("start --mode rephrase", bindings)
-        self.assertIn('omarchy-dictation start")', bindings)
+        self.assertIn('omarchy-dictation start" .. " --operation "', bindings)
 
     def test_refuses_to_shadow_existing_chords_but_ignores_unrelated_profiles(self):
         self.paths.voxtype_config.write_text(
@@ -175,11 +175,8 @@ class InstallerTests(unittest.TestCase):
         marker = (self.paths.state / "installed.json").read_text()
         bindings = self.paths.bindings.read_text()
         command = self.paths.bin_dir / install.LAUNCHER
-        command.write_text("#!/bin/sh\necho personal command\n")
+        original = command.read_bytes()
         command.chmod(0o750)
-        link = self.paths.bin_dir / install.SCRIPT
-        link.unlink()
-        link.symlink_to("personal-target")
         with (
             patch.object(install, "run", side_effect=self.system.run),
             patch.object(
@@ -190,9 +187,8 @@ class InstallerTests(unittest.TestCase):
             install.apply(self.source, self.paths, prompt=lambda _: "test-key")
         self.assertEqual(self.paths.voxtype_config.read_text(), self.voxtype_original)
         self.assertEqual(self.paths.bindings.read_text(), bindings)
-        self.assertEqual(command.read_text(), "#!/bin/sh\necho personal command\n")
+        self.assertEqual(command.read_bytes(), original)
         self.assertEqual(command.stat().st_mode & 0o777, 0o750)
-        self.assertEqual(os.readlink(link), "personal-target")
         self.assertEqual((self.paths.state / "installed.json").read_text(), marker)
 
     def test_edit_block_round_trips_without_trailing_newline(self):
@@ -320,17 +316,19 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(command.read_bytes(), b"personal binary\x80")
         self.assertEqual(self.paths.settings.read_text(), "invalid JSON")
 
-    def test_first_install_failure_restores_binary_command_and_no_marker(self):
+    def test_first_install_refuses_binary_command_before_side_effects(self):
         self.paths.bin_dir.mkdir()
         command = self.paths.bin_dir / install.LAUNCHER
         command.write_bytes(b"\x7fELF\x80personal")
         command.chmod(0o751)
         with (
             patch.object(install, "run", side_effect=self.system.run),
-            patch.object(install, "restart_services", side_effect=[RuntimeError("bad"), None]),
-            self.assertRaises(RuntimeError),
+            patch.object(install, "ensure_api_key") as credentials,
+            self.assertRaisesRegex(ValueError, "unowned command"),
         ):
             install.apply(self.source, self.paths, prompt=lambda _: "key")
+        credentials.assert_not_called()
+        self.assertEqual(self.system.commands, [])
         self.assertEqual(command.read_bytes(), b"\x7fELF\x80personal")
         self.assertEqual(command.stat().st_mode & 0o777, 0o751)
         self.assertFalse((self.paths.state / "installed.json").exists())
@@ -338,11 +336,212 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(self.paths.vocabulary.exists())
         self.assertEqual(self.paths.bindings.read_text(), self.bindings_original)
 
+    def legacy_commands(self):
+        self.paths.bin_dir.mkdir(exist_ok=True)
+        for name in install.LEGACY_HASHES:
+            data = subprocess.run(
+                ["git", "show", f"610ae09:{name}"], cwd=ROOT, check=True, capture_output=True
+            ).stdout
+            install.atomic_write(self.paths.bin_dir / name, data, 0o755)
+        for name in install.LEGACY_LINKS:
+            (self.paths.bin_dir / name).symlink_to("voxtype-llm")
+        install.atomic_write(self.paths.state / "installed.json", '{"version":"0.1.0"}\n')
+
+    def test_exact_legacy_commands_migrate_and_uninstall(self):
+        for remove in (False, True):
+            with self.subTest(remove=remove):
+                self.legacy_commands()
+                self.apply(remove=remove)
+                for name in ("voxtype-llm", *install.LEGACY_LINKS):
+                    path = self.paths.bin_dir / name
+                    self.assertFalse(path.exists() or path.is_symlink())
+                if not remove:
+                    self.apply(remove=True)
+                self.assertFalse((self.paths.bin_dir / install.WRAPPER).exists())
+
+    def test_markerless_legacy_remnants_preserve_replaced_links(self):
+        self.legacy_commands()
+        (self.paths.state / "installed.json").unlink()
+        replacement = self.paths.bin_dir / install.LEGACY_LINKS[0]
+        replacement.unlink()
+        replacement.symlink_to("personal-target")
+        self.apply(remove=True)
+        self.assertEqual(os.readlink(replacement), "personal-target")
+        self.assertFalse((self.paths.bin_dir / "voxtype-llm").exists())
+        self.assertFalse((self.paths.bin_dir / install.LEGACY_LINKS[1]).is_symlink())
+        self.assertFalse((self.paths.bin_dir / install.WRAPPER).exists())
+
+    def test_legacy_removal_rolls_back_files_links_and_marker(self):
+        self.legacy_commands()
+        files = {name: (self.paths.bin_dir / name).read_bytes() for name in install.LEGACY_HASHES}
+        marker = (self.paths.state / "installed.json").read_bytes()
+        for remove in (False, True):
+            with (
+                self.subTest(remove=remove),
+                patch.object(install, "run", side_effect=self.system.run),
+                patch.object(install, "restart_services", side_effect=[RuntimeError("bad"), None]),
+                self.assertRaisesRegex(RuntimeError, "bad"),
+            ):
+                install.apply(self.source, self.paths, remove=remove, prompt=lambda _: "key")
+            for name, data in files.items():
+                self.assertEqual((self.paths.bin_dir / name).read_bytes(), data)
+            for name in install.LEGACY_LINKS:
+                self.assertEqual(os.readlink(self.paths.bin_dir / name), "voxtype-llm")
+            self.assertEqual((self.paths.state / "installed.json").read_bytes(), marker)
+
+    def test_legacy_personal_replacements_are_preserved(self):
+        self.legacy_commands()
+        (self.paths.bin_dir / "voxtype-llm").write_text("personal script")
+        (self.paths.bin_dir / install.WRAPPER).write_text("personal clipboard")
+        with self.assertRaisesRegex(ValueError, "unowned command"):
+            self.apply()
+        self.apply(remove=True)
+        self.assertEqual((self.paths.bin_dir / "voxtype-llm").read_text(), "personal script")
+        self.assertEqual((self.paths.bin_dir / install.WRAPPER).read_text(), "personal clipboard")
+        for name in install.LEGACY_LINKS:
+            self.assertTrue((self.paths.bin_dir / name).is_symlink())
+
+    def test_collisions_include_symlinks_directories_and_replaced_launchers(self):
+        self.apply()
+        for kind in ("symlink", "directory", "file"):
+            path = self.paths.bin_dir / install.LAUNCHER
+            if path.is_dir():
+                path.rmdir()
+            else:
+                path.unlink()
+            if kind == "symlink":
+                path.symlink_to("missing-personal-target")
+            elif kind == "directory":
+                path.mkdir()
+            else:
+                path.write_text("personal")
+            with (
+                self.subTest(kind=kind),
+                patch.object(install, "ensure_api_key") as credentials,
+                patch.object(install, "provision_runtime") as provision,
+                self.assertRaisesRegex(ValueError, "unowned command"),
+            ):
+                self.apply()
+            credentials.assert_not_called()
+            provision.assert_not_called()
+        with (
+            patch.object(install.Paths, "default", return_value=self.paths),
+            patch.object(sys, "argv", ["install.py"]),
+            patch("builtins.input") as confirmation,
+            patch.object(install, "preflight") as preflight,
+            self.assertRaisesRegex(ValueError, "unowned command"),
+        ):
+            install.main()
+        confirmation.assert_not_called()
+        preflight.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("lua"), "Lua not installed")
+    def test_lua_callbacks_track_physical_key_and_operation(self):
+        settings = dict(install.DEFAULT_SETTINGS, chords=["F23", "SHIFT + F23", "SUPER + D"])
+        harness = """
+local presses, releases, commands = {}, {}, {}
+local translate = false
+hl = {
+  bind = function(key, callback, options)
+    if options.release then releases[key] = callback else presses[key] = callback end
+  end,
+  is_key_down = function() return translate end,
+  exec_cmd = function(command) table.insert(commands, command) end
+}
+o = {bind = function() end}
+"""
+        checks = """
+releases.D()
+assert(#commands == 0)
+presses.F23()
+presses.F23()
+presses['SHIFT + F23']()
+presses['SUPER + D']()
+releases.D()
+assert(#commands == 1)
+releases.F23()
+releases.F23()
+assert(#commands == 2)
+local first = commands[1]:match('start %-%-operation ([%w_-]+)$')
+assert(first and #first <= 128)
+assert(commands[2]:match('stop %-%-operation ([%w_-]+)$') == first)
+translate = true
+presses['SUPER + D']()
+releases.F23()
+assert(#commands == 3)
+releases.D()
+assert(#commands == 4)
+local second = commands[3]:match('start %-%-mode translate %-%-operation ([%w_-]+)$')
+assert(second and second ~= first)
+assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
+"""
+        subprocess.run(
+            ["lua", "-"],
+            input=harness + install.lua_block(settings, Path("/opt/bin")) + checks,
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+
+    def test_credentials_wake_only_existing_marker_after_both_saves(self):
+        marker = self.paths.state / "installed.json"
+        original = b'{ "version": "0.2.0", "custom": true }\n'
+        real_save = install.ensure_api_key
+        for outcome in ("failure", "success", "missing"):
+            if outcome == "missing":
+                marker.unlink()
+            else:
+                install.atomic_write(marker, original, 0o640)
+            inode = marker.stat().st_ino if marker.exists() else None
+            saved = []
+
+            def save(path, host, replace=False):
+                self.assertEqual(marker.stat().st_ino if marker.exists() else None, inode)
+                saved.append(path)
+                if outcome == "failure" and len(saved) == 2:
+                    raise ValueError("repair failed")
+                real_save(path, host, prompt=lambda _: "repaired-key", replace=replace)
+
+            with (
+                self.subTest(outcome=outcome),
+                patch.object(install.Paths, "default", return_value=self.paths),
+                patch.object(sys, "argv", ["install.py", "--credentials"]),
+                patch.object(install.os, "isatty", return_value=True),
+                patch.object(install, "ensure_api_key", side_effect=save),
+            ):
+                if outcome == "failure":
+                    with self.assertRaisesRegex(ValueError, "repair failed"):
+                        install.main()
+                else:
+                    install.main()
+            self.assertEqual(saved, [self.paths.api_key, self.paths.elevenlabs_api_key])
+            if outcome == "missing":
+                self.assertFalse(marker.exists())
+            else:
+                self.assertEqual(marker.read_bytes(), original)
+                self.assertEqual(marker.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(marker.stat().st_ino == inode, outcome == "failure")
+
+    def test_detached_credentials_launcher_does_not_wake_marker(self):
+        marker = self.paths.state / "installed.json"
+        install.atomic_write(marker, '{"version":"0.2.0"}\n')
+        inode = marker.stat().st_ino
+        with (
+            patch.object(install.Paths, "default", return_value=self.paths),
+            patch.object(sys, "argv", ["install.py", "--credentials"]),
+            patch.object(install.os, "isatty", return_value=False),
+            patch.object(install, "run", side_effect=self.system.run),
+            patch.object(install, "ensure_api_key") as save,
+        ):
+            install.main()
+        save.assert_not_called()
+        self.assertEqual(marker.stat().st_ino, inode)
+
     def test_run_daemon_checks_dependencies_without_installing_or_leaking(self):
         output = io.StringIO()
         with (
             redirect_stdout(output),
-            patch.object(install.os, "execv") as execute,
+            patch.object(install.subprocess, "Popen") as execute,
             patch.object(install, "run") as run,
         ):
             install.run_daemon(self.source, self.paths)
@@ -367,13 +566,14 @@ class InstallerTests(unittest.TestCase):
         with (
             patch.object(install.shutil, "which", return_value="/mock/tool"),
             patch.object(install, "run", side_effect=self.system.run),
-            patch.object(install.os, "execv") as execute,
+            patch.object(install.subprocess, "Popen") as execute,
         ):
             install.run_daemon(self.source, self.paths)
         execute.assert_called_once_with(
-            str(self.paths.runtime),
             [str(self.paths.runtime), str(self.source / "voice.py"), "daemon", "--stdio"],
+            start_new_session=True,
         )
+        execute.return_value.wait.assert_called_once_with()
         self.assertNotIn("pip", self.system.commands[-1])
         with patch.object(install.shutil, "which", return_value=None):
             self.assertIn("pw-record", install.runtime_error(self.source, self.paths))

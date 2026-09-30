@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 import os
 import stat
@@ -7,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -400,6 +402,74 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.state["mode"], "translate")
         self.assertIn("translate", cleanup.await_args.args[0])
 
+    async def test_early_release_suppresses_only_its_own_delayed_start(self):
+        (self.config / "elevenlabs_api_key").write_text("fake")
+        for command in ("stop", "start", "start"):
+            result = await self.backend.command({"command": command, "operation": "released-1"})
+            self.assertTrue(result["accepted"])
+        self.assertEqual(self.events, [])
+        self.assertIsNone(self.backend.capture)
+        self.assertIsNone(self.backend.task)
+        with patch("voice.recognize", AsyncMock(side_effect=voice.VoiceError("fixture"))):
+            self.assertTrue(
+                (await self.backend.command({"command": "start", "operation": "next-2"}))[
+                    "accepted"
+                ]
+            )
+            await self.backend.task
+        self.assertIsNotNone(self.backend.capture)
+
+    async def test_operation_release_cannot_stop_another_press(self):
+        (self.config / "elevenlabs_api_key").write_text("fake")
+        listening = asyncio.Event()
+
+        async def recognize(audio, key, emit, ready):
+            await ready()
+            listening.set()
+            async for _ in audio:
+                pass
+            return "Complete."
+
+        with (
+            patch("voice.recognize", side_effect=recognize),
+            patch("voice.execute", AsyncMock(return_value=(0, b"Cleaned."))),
+            patch.object(self.backend, "output", AsyncMock()) as output,
+        ):
+            await self.backend.command({"command": "start", "operation": "active-1"})
+            await asyncio.wait_for(listening.wait(), 1)
+            task = self.backend.task
+            self.assertTrue(
+                (await self.backend.command({"command": "start", "operation": "active-1"}))[
+                    "accepted"
+                ]
+            )
+            self.assertFalse(
+                (await self.backend.command({"command": "start", "operation": "other-2"}))[
+                    "accepted"
+                ]
+            )
+            self.assertTrue(
+                (await self.backend.command({"command": "stop", "operation": "other-2"}))[
+                    "accepted"
+                ]
+            )
+            self.assertIs(self.backend.task, task)
+            self.assertEqual(self.backend.state["phase"], "listening")
+            self.assertFalse(self.backend.capture.stopped.is_set())
+            await self.backend.command({"command": "stop", "operation": "active-1"})
+            await task
+            output.assert_awaited_once_with("Cleaned.", "")
+
+    async def test_invalid_operation_is_rejected_without_side_effects(self):
+        for operation in ("", [], "a b", "x" * 129, "中文"):
+            self.assertFalse(
+                (await self.backend.command({"command": "stop", "operation": operation}))[
+                    "accepted"
+                ]
+            )
+        self.assertEqual(self.events, [])
+        self.assertEqual(len(self.backend.stopped_operations), 0)
+
 
 class CaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_pcm_level_math(self):
@@ -544,6 +614,136 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cli_reads_large_unicode_response_and_forwards_operation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
+                socket_path = voice.runtime_directory() / "control.sock"
+                response = {
+                    "accepted": True,
+                    "state": {"text": "混合🗣️text" * 20000},
+                    "preview": {"text": "Different preview." * 10000},
+                }
+                received = []
+
+                async def client(reader, writer):
+                    received.append(json.loads(await reader.readline()))
+                    writer.write(json.dumps(response).encode() + b"\n")
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+
+                server = await asyncio.start_unix_server(client, str(socket_path))
+                socket_path.chmod(0o600)
+                async with server:
+                    for command, mode, operation in (
+                        ("status", None, None),
+                        ("start", "translate", "session-23"),
+                        ("stop", None, "session-23"),
+                    ):
+                        output = io.StringIO()
+                        with redirect_stdout(output):
+                            self.assertEqual(await voice.cli(command, mode, operation), 0)
+                        self.assertEqual(json.loads(output.getvalue()), response)
+                self.assertEqual(
+                    received,
+                    [
+                        {"command": "status"},
+                        {"command": "start", "mode": "translate", "operation": "session-23"},
+                        {"command": "stop", "operation": "session-23"},
+                    ],
+                )
+
+    async def test_daemon_eof_finishes_in_progress_typing(self):
+        for kill_parent in (False, True):
+            with self.subTest(kill_parent=kill_parent):
+                await self.typing_shutdown(kill_parent)
+
+    async def typing_shutdown(self, kill_parent):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o700)
+            config = root / "config/omarchy-dictation"
+            config.mkdir(parents=True)
+            (config / "elevenlabs_api_key").write_text("fake")
+            tools = root / "tools"
+            tools.mkdir()
+            typed = root / "typed"
+            pidfile = root / "typing-pid"
+            (tools / "wtype").write_text(
+                f"#!{sys.executable}\nimport os,sys,time,pathlib\n"
+                "data=sys.stdin.buffer.read()\n"
+                "if data:\n"
+                f" pathlib.Path({str(typed)!r}).write_bytes(data[:5])\n"
+                f" pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+                " time.sleep(.3)\n"
+                f" pathlib.Path({str(typed)!r}).write_bytes(data)\n"
+            )
+            (tools / "wtype").chmod(0o755)
+            env = os.environ | {
+                "XDG_RUNTIME_DIR": str(runtime),
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "PATH": str(tools),
+                "ELEVENLABS_API_KEY": "",
+            }
+            # Bypass only recognition to exercise real daemon teardown and wtype.
+            source = (
+                "import asyncio,voice\n"
+                "async def run(self,testing):\n"
+                " await self.output('Complete fixture text.', '')\n"
+                "voice.Backend.run=run\n"
+                "asyncio.run(voice.daemon())\n"
+            )
+            if kill_parent:
+                source = (
+                    "import subprocess,sys,install\n"
+                    f"command={source!r}\n"
+                    "install.runtime_error=lambda *args: None\n"
+                    "spawn=subprocess.Popen\n"
+                    "def child(args,**kwargs):\n"
+                    " return spawn([sys.executable,'-c',command],**kwargs)\n"
+                    "install.subprocess.Popen=child\n"
+                    "install.run_daemon(install.Path.cwd(),install.Paths.default())\n"
+                )
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                source,
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                for _ in range(3):
+                    await asyncio.wait_for(proc.stdout.readline(), 3)
+                proc.stdin.write(b'{"command":"start"}\n')
+                await proc.stdin.drain()
+                for _ in range(100):
+                    if pidfile.exists():
+                        break
+                    await asyncio.sleep(0.005)
+                self.assertTrue(pidfile.exists())
+                self.assertEqual(typed.read_bytes(), b"Compl")
+                pid = int(pidfile.read_text())
+                proc.stdin.close()
+                if kill_parent:
+                    # Model Quickshell Process destruction: kill only its direct
+                    # parent, while the inherited command stream reaches EOF.
+                    proc.kill()
+                output, error = await asyncio.wait_for(proc.communicate(), 3)
+                self.assertEqual(proc.returncode, -9 if kill_parent else 0, error.decode())
+                self.assertEqual(typed.read_bytes(), b"Complete fixture text.")
+                events = [json.loads(line) for line in output.splitlines()]
+                self.assertTrue(any(e.get("phase") == "done" for e in events))
+                self.assertFalse((runtime / "omarchy-dictation/control.sock").exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            finally:
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+
     async def test_stdio_cli_singleton_permissions_and_eof(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -9,11 +9,13 @@ import fcntl
 import json
 import math
 import os
+import re
 import signal
 import stat
 import struct
 import sys
 import tempfile
+from collections import deque
 from pathlib import Path
 
 from websockets.asyncio.client import connect
@@ -352,6 +354,8 @@ class Backend:
         self.capture = None
         self.task = None
         self.delivering = False
+        self.operation = None
+        self.stopped_operations = deque(maxlen=128)
         self.state = {
             "type": "state",
             "phase": "idle",
@@ -425,6 +429,13 @@ class Backend:
                 command = value.get("command")
                 if not isinstance(command, str):
                     raise VoiceError("Command name must be a string")
+                operation = value.get("operation")
+                if operation is not None and (
+                    command not in {"start", "stop"}
+                    or not isinstance(operation, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", operation)
+                ):
+                    raise VoiceError("Invalid recording operation")
                 if command == "status":
                     return {
                         "accepted": True,
@@ -435,6 +446,15 @@ class Backend:
                 if command == "cancel" or (command == "test" and self.state["phase"] == "testing"):
                     await self.cancel()
                 elif command == "stop":
+                    if operation is not None:
+                        if operation not in self.stopped_operations:
+                            self.stopped_operations.append(operation)
+                        if (
+                            not self.busy
+                            or operation != self.operation
+                            or self.state["phase"] not in {"connecting", "listening"}
+                        ):
+                            return {"accepted": True, "state": self.state}
                     if not self.busy or self.state["phase"] not in {"connecting", "listening"}:
                         raise VoiceError("No active recording to stop")
                     if self.capture:
@@ -448,11 +468,16 @@ class Backend:
                     elif not await self.refresh():
                         raise VoiceError("Cannot load valid settings")
                 elif command in {"start", "test"}:
+                    # A release client can arrive before its independently launched
+                    # press client. Never start capture for an already released press.
+                    if operation is not None and operation in self.stopped_operations:
+                        return {"accepted": True, "state": self.state}
                     if self.busy:
-                        if command == "start" and self.state["phase"] in {
-                            "connecting",
-                            "listening",
-                        }:
+                        if (
+                            command == "start"
+                            and operation == self.operation
+                            and self.state["phase"] in {"connecting", "listening"}
+                        ):
                             return {"accepted": True, "state": self.state}
                         raise VoiceError("Voice backend is busy")
                     if not await self.refresh():
@@ -472,6 +497,7 @@ class Backend:
                         raise VoiceError("Configure an ElevenLabs API key first")
                     self.preview = {"type": "preview", "text": ""}
                     await self.emit(self.preview)
+                    self.operation = operation
                     self.capture = self.capture_factory(microphone)
                     await self.phase("testing" if command == "test" else "connecting")
                     self.task = asyncio.create_task(self.run(command == "test"))
@@ -492,10 +518,20 @@ class Backend:
             raise VoiceError("Final output has already begun and cannot be cancelled safely")
         if not self.busy:
             return
+        if self.operation is not None and self.operation not in self.stopped_operations:
+            self.stopped_operations.append(self.operation)
         self.task.cancel()
         await asyncio.gather(self.task, return_exceptions=True)
         await self.emit({"type": "preview", "text": ""})
         await self.phase("cancelled")
+
+    async def shutdown(self):
+        if self.busy:
+            # Delivery is irreversible but bounded by execute()'s timeout. Reap it
+            # normally; earlier capture/recognition/cleanup must still be cancelled.
+            if not self.delivering:
+                self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
 
     async def run(self, testing):
         capture = self.capture
@@ -711,9 +747,8 @@ async def daemon():
         for task in clients:
             task.cancel()
         await asyncio.gather(*clients, return_exceptions=True)
-        if backend and backend.busy:
-            backend.task.cancel()
-            await asyncio.gather(backend.task, return_exceptions=True)
+        if backend:
+            await backend.shutdown()
         if server:
             socket_path.unlink(missing_ok=True)
         if transport:
@@ -721,7 +756,7 @@ async def daemon():
         os.close(descriptor)
 
 
-async def cli(command, mode):
+async def cli(command, mode, operation=None):
     directory = runtime_directory()
     info = (directory / "control.sock").lstat()
     if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -732,9 +767,13 @@ async def cli(command, mode):
             value = {"command": command}
             if mode:
                 value["mode"] = mode
+            if operation:
+                value["operation"] = operation
             writer.write((json.dumps(value) + "\n").encode())
             await writer.drain()
-            result = json.loads(await reader.readline())
+            # The server closes after one response. Status can contain two large
+            # transcripts, including JSON-escaped Unicode, beyond readline's limit.
+            result = json.loads(await reader.read())
             print(json.dumps(result))
             return 0 if result.get("accepted") else 1
         finally:
@@ -747,11 +786,16 @@ def main():
     parser.add_argument("command", choices=["daemon", "start", "stop", "cancel", "test", "status"])
     parser.add_argument("--stdio", action="store_true")
     parser.add_argument("--mode", choices=sorted(MODES))
+    parser.add_argument("--operation", help="Correlate a hotkey press and release")
     args = parser.parse_args()
     if args.command == "daemon" and not args.stdio:
         parser.error("daemon requires --stdio")
+    if args.operation is not None and args.command not in {"start", "stop"}:
+        parser.error("--operation requires start or stop")
     try:
-        return asyncio.run(daemon() if args.command == "daemon" else cli(args.command, args.mode))
+        return asyncio.run(
+            daemon() if args.command == "daemon" else cli(args.command, args.mode, args.operation)
+        )
     except (VoiceError, OSError, TimeoutError, ValueError):
         print("Voice backend unavailable or invalid request", file=sys.stderr)
         return 1
