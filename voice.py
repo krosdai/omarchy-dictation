@@ -773,7 +773,7 @@ async def cli(command, mode, operation=None):
             value = {"command": command}
             if mode:
                 value["mode"] = mode
-            if operation:
+            if operation is not None:
                 value["operation"] = operation
             writer.write((json.dumps(value) + "\n").encode())
             await writer.drain()

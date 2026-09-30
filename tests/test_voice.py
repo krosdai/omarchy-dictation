@@ -656,6 +656,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                         ("status", None, None),
                         ("start", "translate", "session-23"),
                         ("stop", None, "session-23"),
+                        ("stop", None, ""),
                     ):
                         output = io.StringIO()
                         with redirect_stdout(output):
@@ -667,6 +668,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                         {"command": "status"},
                         {"command": "start", "mode": "translate", "operation": "session-23"},
                         {"command": "stop", "operation": "session-23"},
+                        {"command": "stop", "operation": ""},
                     ],
                 )
 
