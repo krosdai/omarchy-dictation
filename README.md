@@ -97,7 +97,7 @@ editing the file and re-running setup, which replaces only its managed bindings.
 
 ```json
 {
-  "chords": ["SUPER + D"],
+  "chords": ["F23", "SHIFT + F23", "ALT + SHIFT + F23", "SUPER + SHIFT + F23"],
   "translate_key": "Shift_R",
   "polish_chord": "SUPER + SHIFT + T",
   "post_process_timeout_ms": 20000,
