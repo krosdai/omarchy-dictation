@@ -27,7 +27,8 @@ them as unavailable; no synthetic waveform or pretend AI reply is shown.
 - PipeWire tools: `pw-record`, `pw-dump`, `wpctl`.
 - `wtype`, `wl-copy`, `wl-paste`, `curl`, `jq` 1.7+, and `notify-send`.
 - An ElevenLabs API key with Scribe Realtime access, plus a key for your text
-  provider (Cerebras by default).
+  provider (Cerebras by default). Keys already exported in your desktop session
+  are used as-is; see [API keys from the environment](#api-keys-from-the-environment).
 
 Audio is uploaded to ElevenLabs. Dictated and clipboard text goes to your selected
 text provider, unless it is local. Both services may bill your account. The
@@ -49,8 +50,9 @@ use the isolated development checks below until you are ready to migrate.
 `plugin add` clones Git history and does not include uncommitted local edits.
 
 Enabling starts the plugin service and, if setup is needed, opens a terminal asking
-for confirmation. Setup creates private credentials, a Python runtime and command
-launchers, then backs up and adds managed bindings to `~/.config/hypr/bindings.lua`.
+for confirmation. Setup asks for any API key not already in the environment and
+stores it privately, creates a Python runtime and command launchers, then backs up
+and adds managed bindings to `~/.config/hypr/bindings.lua`.
 It reloads Hyprland and checks for configuration errors. A failed reload restores
 the previous bindings and launchers. Credentials and the runtime are retained.
 Setup refuses to overwrite a personal command or a modified plugin launcher;
@@ -97,7 +99,7 @@ editing the file and re-running setup, which replaces only its managed bindings.
 
 ```json
 {
-  "chords": ["SUPER + D"],
+  "chords": ["F23", "SHIFT + F23", "ALT + SHIFT + F23", "SUPER + SHIFT + F23"],
   "translate_key": "Shift_R",
   "polish_chord": "SUPER + SHIFT + T",
   "post_process_timeout_ms": 20000,
@@ -116,28 +118,70 @@ changes while the key is held. Escape cancels an active operation and is also pa
 to the focused application; it does nothing to the plugin when idle.
 
 Provider and model changes apply to the next operation. **When changing providers,
-update the key too**: otherwise the existing key is sent to the new endpoint.
-Use the panel's secure-terminal button or:
+update the key too**: otherwise the existing `api_key` file or
+`DICTATION_LLM_API_KEY` is sent to the new endpoint. Provider-specific variables
+(below) follow the host automatically. Use the panel's secure-terminal button or:
 
 ```sh
 /usr/bin/python /absolute/path/to/omarchy-dictation/install.py --credentials
 ```
 
-Any OpenAI-compatible Chat Completions endpoint can be used. Examples:
+Any OpenAI-compatible Chat Completions endpoint can be used. Examples, with the
+environment variable read for each host:
 
-| Provider | `base_url` |
-| --- | --- |
-| Cerebras | `https://api.cerebras.ai/v1` |
-| OpenAI | `https://api.openai.com/v1` |
-| Groq | `https://api.groq.com/openai/v1` |
-| OpenRouter | `https://openrouter.ai/api/v1` |
-| Ollama | `http://localhost:11434/v1` |
+| Provider | `base_url` | Key variable |
+| --- | --- | --- |
+| Cerebras | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` |
+| OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| Groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| Mistral | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
+| DeepSeek | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| Together AI | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
+| Fireworks AI | `https://api.fireworks.ai/inference/v1` | `FIREWORKS_API_KEY` |
+| xAI | `https://api.x.ai/v1` | `XAI_API_KEY` |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
+| Ollama | `http://localhost:11434/v1` | none |
 
 Select a model available to your account. Set `reasoning_effort` to `null` to omit
 it. Plain HTTP is accepted only for localhost; credentials, query strings and
 fragments are rejected in the URL. A keyless local endpoint still requires a
-nonempty key file; any placeholder will do. Servers rejecting structured-output
-options with HTTP 400/422 are retried once without optional request fields.
+nonempty key, from the key file or `DICTATION_LLM_API_KEY`; any placeholder will do.
+Servers rejecting structured-output options with HTTP 400/422 are retried once
+without optional request fields.
+
+### API keys from the environment
+
+Keys already in the environment are used instead of the key files, and setup then
+neither asks for them nor copies them to disk; it prints the variable name it uses,
+never the value. For each key the first non-blank source wins:
+
+| Key | Precedence |
+| --- | --- |
+| Text provider | `DICTATION_LLM_API_KEY`, then the key variable for the `base_url` host (table above), then `api_key` |
+| Recognition | `ELEVENLABS_API_KEY`, then `elevenlabs_api_key` |
+
+The host is matched exactly, ignoring case and port, so `CEREBRAS_API_KEY` is only
+ever sent to `api.cerebras.ai`. Other hosts use `DICTATION_LLM_API_KEY` or the file.
+The same order applies to setup, the plugin's readiness check, the backend,
+`dictation-llm` and clipboard polishing.
+
+The backend is started by omarchy-shell and the hotkeys run commands from Hyprland,
+so the variables must be in the **desktop session's** environment. Exporting them
+from `~/.bashrc` or another interactive shell file only affects terminals. On
+Omarchy, uwsm sources `~/.config/uwsm/env` when the session starts:
+
+```sh
+export CEREBRAS_API_KEY="your-text-provider-key"
+export ELEVENLABS_API_KEY="your-elevenlabs-key"
+```
+
+Log out and back in after changing it. Because that file is a shell script, a line
+can also read the key from a password manager instead of storing it in plain text.
+
+`install.py --credentials` still writes both key files when you run it. If a
+variable is set it says so, because that variable keeps taking precedence over the
+file it just wrote.
 
 Vocabulary edits apply immediately during cleanup, not during audio recognition.
 The waveform is measured from the actual captured PCM; display gain does not
@@ -176,7 +220,9 @@ printf '这个功能下周完成' | dictation-llm --mode translate
 The last two commands contact the configured text provider. Manual script use
 supports `DICTATION_LLM_API_KEY`, `DICTATION_LLM_API_KEY_FILE`,
 `DICTATION_LLM_BASE_URL`, `DICTATION_LLM_MODEL`, `DICTATION_LLM_SETTINGS_FILE` and
-`DICTATION_VOCABULARY_FILE`. Normal plugin use takes configuration from its files.
+`DICTATION_VOCABULARY_FILE`. During dictation the backend takes the provider and
+model from `settings.json`, ignoring the `BASE_URL` and `MODEL` overrides, but key
+variables from the session environment still apply.
 
 ## Remove
 

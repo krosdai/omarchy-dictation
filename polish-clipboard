@@ -4,8 +4,9 @@
 # Meant for a key binding: copy a draft, press the key, paste the polished text.
 #
 # Uses `dictation-llm --mode polish --strict` (same directory or PATH), so the
-# clipboard is only replaced when the rewrite actually succeeded. Progress and
-# errors are shown with notify-send.
+# clipboard is only replaced when the rewrite actually succeeded; it takes the same
+# key variables and key file as dictation-llm, from the session environment.
+# Progress and errors are shown with notify-send.
 set -uo pipefail
 
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"

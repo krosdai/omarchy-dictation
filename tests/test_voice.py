@@ -16,7 +16,18 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 import voice
-from install import DEFAULT_SETTINGS, load_settings
+from install import (
+    DEFAULT_SETTINGS,
+    PROVIDER_KEY_VARIABLES,
+    RECOGNITION_KEY_VARIABLES,
+    TEXT_KEY_VARIABLE,
+    load_settings,
+)
+
+# Blank, not absent: a developer's own keys must not make missing files look set.
+NO_KEYS = dict.fromkeys(
+    (TEXT_KEY_VARIABLE, *PROVIDER_KEY_VARIABLES.values(), *RECOGNITION_KEY_VARIABLES), ""
+)
 
 
 async def packets(*chunks):
@@ -219,7 +230,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.device_patch.start()
-        self.env_patch = patch.dict(os.environ, {"ELEVENLABS_API_KEY": ""})
+        self.env_patch = patch.dict(os.environ, NO_KEYS)
         self.env_patch.start()
 
     async def asyncTearDown(self):
@@ -315,7 +326,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             patch("voice.execute", AsyncMock(return_value=(1, b""))) as cleanup,
             patch.dict(
                 os.environ,
-                {"DICTATION_LLM_API_KEY": "wrong-key", "DICTATION_LLM_MODEL": "wrong-model"},
+                {"DICTATION_LLM_API_KEY": "env-key", "DICTATION_LLM_MODEL": "wrong-model"},
             ),
             patch.object(self.backend, "output", AsyncMock()) as output,
         ):
@@ -325,11 +336,36 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 "Complete raw.", "Cleanup failed; using the complete original transcript"
             )
             env = cleanup.await_args.kwargs["env"]
-            self.assertNotIn("DICTATION_LLM_API_KEY", env)
+            # Keys from the session environment win; the provider stays in settings.
+            self.assertEqual(env["DICTATION_LLM_API_KEY"], "env-key")
             self.assertNotIn("DICTATION_LLM_MODEL", env)
             self.assertEqual(env["DICTATION_VOCABULARY_FILE"], str(self.config / "vocabulary.txt"))
             self.assertEqual(env["DICTATION_LLM_API_KEY_FILE"], str(self.config / "api_key"))
         self.assertNotIn("secret-not-for-events", json.dumps(self.events))
+
+    async def test_environment_keys_configure_backend_and_win_over_files(self):
+        await self.backend.command({"command": "settings"})
+        self.assertFalse(self.backend.settings_event["asr_configured"])
+        self.assertFalse(self.backend.settings_event["llm_configured"])
+        (self.config / "elevenlabs_api_key").write_text("file-recognition-key\n")
+        with patch.dict(
+            os.environ,
+            {"ELEVENLABS_API_KEY": "env-recognition-key", "CEREBRAS_API_KEY": "env-text-key"},
+        ):
+            await self.backend.command({"command": "settings"})
+            self.assertTrue(self.backend.settings_event["asr_configured"])
+            self.assertTrue(self.backend.settings_event["llm_configured"])
+            with (
+                patch("voice.recognize", AsyncMock(return_value="")) as recognizer,
+                patch("voice.execute", AsyncMock()),
+            ):
+                await self.backend.command({"command": "start"})
+                await self.backend.task
+            self.assertEqual(recognizer.await_args.args[1], "env-recognition-key")
+            # A provider variable never configures a different provider.
+            await self.backend.configure({"base_url": "https://api.openai.com/v1"})
+            self.assertFalse(self.backend.settings_event["llm_configured"])
+        self.assertNotIn("env-", json.dumps(self.events))
 
     async def test_cancel_cleanup_never_outputs(self):
         (self.config / "elevenlabs_api_key").write_text("fake")

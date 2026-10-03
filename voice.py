@@ -20,7 +20,14 @@ from pathlib import Path
 
 from websockets.asyncio.client import connect
 
-from install import DEFAULT_SETTINGS, atomic_write, load_settings
+from install import (
+    DEFAULT_SETTINGS,
+    RECOGNITION_KEY_VARIABLES,
+    atomic_write,
+    load_settings,
+    read_key,
+    text_key_variables,
+)
 
 ENDPOINT = (
     "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime"
@@ -331,16 +338,6 @@ async def recognize(audio, key, emit, ready, endpoint=ENDPOINT, timeout=TIMEOUT)
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def read_key(path, environment=None):
-    value = os.environ.get(environment, "") if environment else ""
-    if value.strip():
-        return value.strip()
-    try:
-        return path.read_text().strip()
-    except FileNotFoundError:
-        return ""
-
-
 class Backend:
     def __init__(self, emit, config=None, capture_factory=Capture):
         self.emit_output = emit
@@ -401,9 +398,11 @@ class Backend:
                     for d in inputs
                 ],
                 "asr_configured": bool(
-                    read_key(self.config / "elevenlabs_api_key", "ELEVENLABS_API_KEY")
+                    read_key(self.config / "elevenlabs_api_key", RECOGNITION_KEY_VARIABLES)
                 ),
-                "llm_configured": bool(read_key(self.config / "api_key")),
+                "llm_configured": bool(
+                    read_key(self.config / "api_key", text_key_variables(self.settings["base_url"]))
+                ),
             }
             await self.emit(self.settings_event)
             return True
@@ -556,7 +555,7 @@ class Backend:
 
             raw = await recognize(
                 capture.chunks(),
-                read_key(self.config / "elevenlabs_api_key", "ELEVENLABS_API_KEY"),
+                read_key(self.config / "elevenlabs_api_key", RECOGNITION_KEY_VARIABLES),
                 self.emit,
                 ready,
             )
@@ -570,8 +569,9 @@ class Backend:
             text = raw
             try:
                 env = os.environ.copy()
-                # The plugin's saved settings own cleanup configuration.
-                for suffix in ("API_KEY", "BASE_URL", "MODEL"):
+                # The plugin's saved settings own the provider; key variables from the
+                # session environment are passed on and win over the key file.
+                for suffix in ("BASE_URL", "MODEL"):
                     env.pop(f"DICTATION_LLM_{suffix}", None)
                 env["DICTATION_VOCABULARY_FILE"] = str(self.config / "vocabulary.txt")
                 env["DICTATION_LLM_SETTINGS_FILE"] = str(self.config / "settings.json")
