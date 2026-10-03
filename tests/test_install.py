@@ -19,6 +19,21 @@ sys.path.insert(0, str(ROOT))
 
 import install  # noqa: E402
 
+KEY_VARIABLES = (
+    install.TEXT_KEY_VARIABLE,
+    *install.PROVIDER_KEY_VARIABLES.values(),
+    *install.RECOGNITION_KEY_VARIABLES,
+)
+
+
+def without_key_variables(test):
+    """Keep a developer's own API keys out of tests that expect key files."""
+    environment = patch.dict(os.environ)
+    environment.start()
+    test.addCleanup(environment.stop)
+    for name in KEY_VARIABLES:
+        os.environ.pop(name, None)
+
 
 class FakeSystem:
     """Records system and pip commands without executing any of them."""
@@ -62,6 +77,7 @@ class InstallerTests(unittest.TestCase):
         self.paths.bindings.parent.mkdir(parents=True)
         self.paths.bindings.write_text(self.bindings_original)
         self.system = FakeSystem()
+        without_key_variables(self)
 
     def apply(self, **kwargs):
         with patch.object(install, "run", side_effect=self.system.run):
@@ -524,12 +540,18 @@ assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
             inode = marker.stat().st_ino if marker.exists() else None
             saved = []
 
-            def save(path, host, replace=False):
+            def save(path, host, replace=False, variables=()):
                 self.assertEqual(marker.stat().st_ino if marker.exists() else None, inode)
                 saved.append(path)
                 if outcome == "failure" and len(saved) == 2:
                     raise ValueError("repair failed")
-                real_save(path, host, prompt=lambda _: "repaired-key", replace=replace)
+                real_save(
+                    path,
+                    host,
+                    prompt=lambda _: "repaired-key",
+                    replace=replace,
+                    variables=variables,
+                )
 
             with (
                 self.subTest(outcome=outcome),
@@ -691,6 +713,106 @@ assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
         self.assertEqual(self.paths.api_key.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.paths.api_key.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(output.getvalue(), "")
+
+    def apply_without_prompt(self):
+        def prompt(_):
+            raise AssertionError("setup must not ask for a key the environment provides")
+
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(install, "run", side_effect=self.system.run):
+            install.apply(self.source, self.paths, prompt=prompt)
+        return output.getvalue()
+
+    def ready(self):
+        install.atomic_write(self.paths.runtime, "fake runtime", 0o755)
+        with (
+            patch.object(install.shutil, "which", return_value="/mock/tool"),
+            patch.object(install, "run", side_effect=self.system.run),
+        ):
+            return install.runtime_error(self.source, self.paths)
+
+    def test_environment_keys_skip_prompts_and_key_files(self):
+        os.environ["CEREBRAS_API_KEY"] = " env-text-secret\n"
+        os.environ["ELEVENLABS_API_KEY"] = "env-recognition-secret"
+        output = self.apply_without_prompt()
+        self.assertFalse(self.paths.api_key.exists())
+        self.assertFalse(self.paths.elevenlabs_api_key.exists())
+        self.assertIn("api.cerebras.ai key from $CEREBRAS_API_KEY", output)
+        self.assertIn("ElevenLabs recognition key from $ELEVENLABS_API_KEY", output)
+        self.assertNotIn("secret", output)
+        self.assertIsNone(self.ready())
+        os.environ["DICTATION_LLM_API_KEY"] = "generic-secret"
+        os.environ["CEREBRAS_API_KEY"] = ""
+        self.assertIsNone(self.ready())
+        self.assertIn("$DICTATION_LLM_API_KEY", self.apply_without_prompt())
+        for blank in ("", "  \n"):
+            with self.subTest(blank=blank):
+                os.environ["DICTATION_LLM_API_KEY"] = blank
+                self.assertIn("Credentials missing", self.ready())
+        os.environ["CEREBRAS_API_KEY"] = "env-text-secret"
+        os.environ["ELEVENLABS_API_KEY"] = " "
+        self.assertIn("Credentials missing", self.ready())
+
+    def test_provider_variable_applies_only_to_its_host(self):
+        os.environ["CEREBRAS_API_KEY"] = "cerebras-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "recognition-secret"
+        install.atomic_write(
+            self.paths.settings, json.dumps({"base_url": "https://api.openai.com/v1"})
+        )
+        with self.assertRaisesRegex(AssertionError, "must not ask"):
+            self.apply_without_prompt()
+        os.environ["OPENAI_API_KEY"] = "openai-secret"
+        self.assertIn("$OPENAI_API_KEY", self.apply_without_prompt())
+        self.assertFalse(self.paths.api_key.exists())
+        variables = {
+            "https://API.Cerebras.ai:443/v1": ("DICTATION_LLM_API_KEY", "CEREBRAS_API_KEY"),
+            "https://openrouter.ai/api/v1": ("DICTATION_LLM_API_KEY", "OPENROUTER_API_KEY"),
+            "http://localhost:11434/v1": ("DICTATION_LLM_API_KEY",),
+            "https://api.cerebras.ai.example/v1": ("DICTATION_LLM_API_KEY",),
+        }
+        for url, expected in variables.items():
+            self.assertEqual(install.text_key_variables(url), expected)
+
+    def test_environment_keys_override_existing_files_without_touching_them(self):
+        for path in (self.paths.api_key, self.paths.elevenlabs_api_key):
+            install.atomic_write(path, "file-secret\n", 0o644)
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "env-secret"
+        self.apply_without_prompt()
+        for path in (self.paths.api_key, self.paths.elevenlabs_api_key):
+            self.assertEqual(path.read_text(), "file-secret\n")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        variables = install.text_key_variables(install.DEFAULT_SETTINGS["base_url"])
+        self.assertEqual(install.read_key(self.paths.api_key, variables), "env-secret")
+        os.environ["DICTATION_LLM_API_KEY"] = "generic-secret"
+        self.assertEqual(install.read_key(self.paths.api_key, variables), "generic-secret")
+        os.environ["DICTATION_LLM_API_KEY"] = os.environ["CEREBRAS_API_KEY"] = " "
+        self.assertEqual(install.read_key(self.paths.api_key, variables), "file-secret")
+
+    def test_explicit_credentials_write_files_and_name_overriding_variables(self):
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        install.atomic_write(self.paths.state / "installed.json", '{"version":"0.2.0"}\n')
+        real_save = install.ensure_api_key
+
+        def save(path, host, replace=False, variables=()):
+            real_save(
+                path, host, prompt=lambda _: "typed-secret", replace=replace, variables=variables
+            )
+
+        output = io.StringIO()
+        with (
+            redirect_stdout(output),
+            patch.object(install.Paths, "default", return_value=self.paths),
+            patch.object(sys, "argv", ["install.py", "--credentials"]),
+            patch.object(install.os, "isatty", return_value=True),
+            patch.object(install, "ensure_api_key", side_effect=save),
+        ):
+            install.main()
+        self.assertEqual(self.paths.api_key.read_text(), "typed-secret\n")
+        self.assertEqual(self.paths.elevenlabs_api_key.read_text(), "typed-secret\n")
+        self.assertIn("$CEREBRAS_API_KEY is set here and takes precedence", output.getvalue())
+        self.assertNotIn("ELEVENLABS_API_KEY", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
 
     def test_installed_script_launcher_uses_current_checkout(self):
         self.apply()
