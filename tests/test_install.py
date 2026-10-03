@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -932,6 +933,109 @@ class ScriptTests(unittest.TestCase):
         self.assertIn(f'DEFAULT_BASE_URL="{defaults["base_url"]}"', script)
         self.assertIn(f'DEFAULT_MODEL="{defaults["model"]}"', script)
         self.assertIn(f'DEFAULT_REASONING_EFFORT="{defaults["reasoning_effort"]}"', script)
+
+    def fake_curl(self):
+        """A curl stand-in recording the bearer key and URL; no provider is contacted."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        tools = Path(directory.name)
+        reply = {"choices": [{"message": {"content": '{"text": "Hello"}'}}]}
+        (tools / "reply.json").write_text(json.dumps(reply))
+        (tools / "curl").write_text(
+            "#!/bin/bash\n"
+            'for arg; do case "$arg" in "Authorization: Bearer "*)'
+            ' printf "%s\\n" "${arg#Authorization: Bearer }" >> "${0%/*}/keys" ;; esac; done\n'
+            'printf "%s\\n" "${@: -1}" >> "${0%/*}/urls"\n'
+            'cat "${0%/*}/reply.json"; printf "\\n200"\n'
+        )
+        (tools / "curl").chmod(0o755)
+        return tools
+
+    def sent_key(self, tools, **variables):
+        """Run dictation-llm with only the given variables; return (key sent, URL)."""
+        key_file = tools / "api_key"
+        key_file.write_text("file-key\n")
+        result = subprocess.run(
+            ["bash", str(ROOT / "dictation-llm"), "--mode", "rephrase"],
+            input="hello world",
+            capture_output=True,
+            text=True,
+            env={
+                "HOME": "/nonexistent",
+                "PATH": f"{tools}:/usr/bin:/bin",
+                "DICTATION_LLM_API_KEY_FILE": str(key_file),
+                **variables,
+            },
+            check=True,
+        )
+        self.assertEqual(result.stdout, "Hello", result.stderr)
+        sent = [(tools / name).read_text().splitlines() for name in ("keys", "urls")]
+        for name in ("keys", "urls"):
+            (tools / name).unlink()
+        self.assertEqual(len(sent[0]), 1)
+        return sent[0][0], sent[1][0]
+
+    def test_script_provider_table_matches_installer(self):
+        script = (ROOT / "dictation-llm").read_text()
+        table = script[script.index("provider_key_variable() {") :]
+        table = table[: table.index("\n}\n")]
+        self.assertEqual(
+            dict(re.findall(r"^ +([a-z0-9.-]+)\) echo ([A-Z0-9_]+) ;;$", table, re.M)),
+            install.PROVIDER_KEY_VARIABLES,
+        )
+
+    def test_script_uses_the_variable_of_the_configured_host(self):
+        tools = self.fake_curl()
+        for host, variable in install.PROVIDER_KEY_VARIABLES.items():
+            with self.subTest(host=host):
+                decoy = "OPENAI_API_KEY" if variable != "OPENAI_API_KEY" else "GROQ_API_KEY"
+                key, url = self.sent_key(
+                    tools,
+                    DICTATION_LLM_BASE_URL=f"https://{host.upper()}/v1",
+                    **{variable: f"{variable}-value", decoy: "decoy-value"},
+                )
+                self.assertEqual(key, f"{variable}-value")
+                self.assertEqual(url, f"https://{host.upper()}/v1/chat/completions")
+
+    def test_script_key_precedence_environment_over_file(self):
+        tools = self.fake_curl()
+        cerebras = {"DICTATION_LLM_BASE_URL": "https://api.cerebras.ai/v1"}
+        for variables, expected in (
+            ({"DICTATION_LLM_API_KEY": "generic", "CEREBRAS_API_KEY": "provider"}, "generic"),
+            ({"DICTATION_LLM_API_KEY": " \t", "CEREBRAS_API_KEY": "provider"}, "provider"),
+            ({"CEREBRAS_API_KEY": " provider\n"}, "provider"),
+            ({"CEREBRAS_API_KEY": "  "}, "file-key"),
+            ({"OPENAI_API_KEY": "other-provider"}, "file-key"),
+            ({}, "file-key"),
+        ):
+            with self.subTest(variables=variables):
+                self.assertEqual(self.sent_key(tools, **cerebras, **variables)[0], expected)
+        # The default provider comes from the settings file when no URL override is set.
+        self.assertEqual(self.sent_key(tools, CEREBRAS_API_KEY="from-env")[0], "from-env")
+
+    def test_clipboard_polish_uses_environment_key(self):
+        tools = self.fake_curl()
+        clipboard = tools / "clipboard"
+        clipboard.write_text("draft text\n")
+        for name, script in {
+            "wl-paste": f'#!/bin/sh\ncat "{clipboard}"\n',
+            "wl-copy": f'#!/bin/sh\ncat > "{clipboard}"\n',
+            "notify-send": "#!/bin/sh\necho 1\n",
+        }.items():
+            (tools / name).write_text(script)
+            (tools / name).chmod(0o755)
+        subprocess.run(
+            ["bash", str(ROOT / "polish-clipboard")],
+            env={
+                "HOME": "/nonexistent",
+                "PATH": f"{tools}:/usr/bin:/bin",
+                "CEREBRAS_API_KEY": "polish-env-key",
+            },
+            check=True,
+            capture_output=True,
+        )
+        self.assertEqual(clipboard.read_text(), "Hello\n")
+        self.assertEqual((tools / "keys").read_text(), "polish-env-key\n")
 
     def test_unsafe_base_urls_are_refused(self):
         for url in (
