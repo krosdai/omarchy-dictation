@@ -179,6 +179,12 @@ export ELEVENLABS_API_KEY="your-elevenlabs-key"
 Log out and back in after changing it. Because that file is a shell script, a line
 can also read the key from a password manager instead of storing it in plain text.
 
+When you run `install.py` by hand, setup compares the keys it sees with the session
+environment (`systemctl --user show-environment`, which uwsm starts Hyprland from).
+A variable present only in your terminal is reported by name and ignored, and setup
+asks for the key to store in the key file instead. If the session environment
+cannot be read, setup trusts the terminal and reminds you to set the variable there.
+
 `install.py --credentials` still writes both key files when you run it. If a
 variable is set it says so, because that variable keeps taking precedence over the
 file it just wrote.

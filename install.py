@@ -221,6 +221,35 @@ def read_key(path, variables=()):
         return ""
 
 
+def session_environment_names():
+    """Variables set non-blank in the systemd user environment, or None if unreadable.
+
+    uwsm runs Hyprland, and through it omarchy-shell, from this environment, so a key
+    exported only by an interactive shell never reaches the backend or the hotkeys.
+    Only names leave this function; values are never logged.
+    """
+    try:
+        listing = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            check=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    names = set()
+    for line in listing.splitlines():
+        name, _, value = line.partition("=")
+        # systemctl quotes values containing special characters as $'...'.
+        if value.startswith("$'") and value.endswith("'"):
+            value = value[2:-1]
+        if value.strip():
+            names.add(name)
+    return names
+
+
 def credential_sources(paths, settings):
     """(label, key file, environment variables) for the text and recognition keys."""
     return (
@@ -428,6 +457,15 @@ def ensure_api_key(path, host, prompt=getpass.getpass, replace=False, variables=
         raise ValueError("Private credential files must not be symlinks")
     # Name the variable, never its value; an environment key is never copied to disk.
     environment = environment_key(variables)
+    session = session_environment_names() if environment else None
+    if environment and session is not None and environment not in session:
+        # A hand-run setup may see keys the desktop session does not have.
+        print(
+            f"${environment} is set in this terminal but not in your desktop session, so "
+            "dictation cannot use it.\n  To rely on it, export it in ~/.config/uwsm/env "
+            "and log in again; until then the key file is used."
+        )
+        environment = None
     if not replace:
         if environment:
             # The file is unused, so never parse it; still keep an old copy private.
@@ -435,6 +473,11 @@ def ensure_api_key(path, host, prompt=getpass.getpass, replace=False, variables=
                 path.parent.chmod(0o700)
                 path.chmod(0o600)
             print(f"Using the {host} key from ${environment}; it is not written to a file.")
+            if session is None:
+                print(
+                    "  The desktop session environment could not be read; make sure "
+                    f"${environment} is set there too, e.g. in ~/.config/uwsm/env."
+                )
             return
         if path.exists() and path.read_text().strip():
             path.parent.chmod(0o700)

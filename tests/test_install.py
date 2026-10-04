@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 import install  # noqa: E402
 
+real_session_environment_names = install.session_environment_names
 KEY_VARIABLES = (
     install.TEXT_KEY_VARIABLE,
     *install.PROVIDER_KEY_VARIABLES.values(),
@@ -79,6 +80,12 @@ class InstallerTests(unittest.TestCase):
         self.paths.bindings.write_text(self.bindings_original)
         self.system = FakeSystem()
         without_key_variables(self)
+        # Never query the real desktop session; by default it matches this process.
+        session = patch.object(
+            install, "session_environment_names", return_value=set(KEY_VARIABLES)
+        )
+        self.session = session.start()
+        self.addCleanup(session.stop)
 
     def apply(self, **kwargs):
         with patch.object(install, "run", side_effect=self.system.run):
@@ -798,6 +805,56 @@ assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
         self.assertEqual(self.paths.api_key.read_bytes(), b"\xff\xfe not utf-8\n")
         self.assertEqual(self.paths.api_key.stat().st_mode & 0o777, 0o600)
         self.assertIsNone(self.ready())
+
+    def test_terminal_only_keys_warn_and_fall_back_to_key_file(self):
+        os.environ["CEREBRAS_API_KEY"] = "terminal-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "session-secret"
+        self.session.return_value = {"ELEVENLABS_API_KEY", "PATH"}
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(install, "run", side_effect=self.system.run):
+            install.apply(self.source, self.paths, prompt=lambda _: "typed-key")
+        self.assertEqual(self.paths.api_key.read_text(), "typed-key\n")
+        self.assertFalse(self.paths.elevenlabs_api_key.exists())
+        self.assertIn(
+            "$CEREBRAS_API_KEY is set in this terminal but not in your desktop session",
+            output.getvalue(),
+        )
+        self.assertIn("~/.config/uwsm/env", output.getvalue())
+        self.assertIn("key from $ELEVENLABS_API_KEY", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
+        # Once a key file exists it serves the desktop; the warning stays visible.
+        self.assertIn("not in your desktop session", self.apply_without_prompt())
+        self.assertEqual(self.paths.api_key.read_text(), "typed-key\n")
+
+    def test_unreadable_session_environment_is_not_fatal(self):
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "env-secret"
+        self.session.return_value = None
+        output = self.apply_without_prompt()
+        self.assertFalse(self.paths.api_key.exists())
+        self.assertFalse(self.paths.elevenlabs_api_key.exists())
+        self.assertIn("could not be read; make sure $CEREBRAS_API_KEY is set there", output)
+        self.assertNotIn("secret", output)
+
+    def test_session_environment_names_never_fail_setup(self):
+        listing = "PATH=/usr/bin\nBLANK=\nQUOTED_BLANK=$''\nSPACES=$'  '\nQUOTED=$'a b'\n"
+        with patch.object(
+            install.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=listing),
+        ) as query:
+            self.assertEqual(real_session_environment_names(), {"PATH", "QUOTED"})
+        self.assertEqual(query.call_args.args[0], ["systemctl", "--user", "show-environment"])
+        for failure in (
+            FileNotFoundError("systemctl"),
+            subprocess.CalledProcessError(1, "systemctl"),
+            subprocess.TimeoutExpired("systemctl", 5),
+        ):
+            with (
+                self.subTest(failure=failure),
+                patch.object(install.subprocess, "run", side_effect=failure),
+            ):
+                self.assertIsNone(real_session_environment_names())
 
     def test_explicit_credentials_write_files_and_name_overriding_variables(self):
         os.environ["CEREBRAS_API_KEY"] = "env-secret"
