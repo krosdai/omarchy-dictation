@@ -790,6 +790,15 @@ assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
         os.environ["DICTATION_LLM_API_KEY"] = os.environ["CEREBRAS_API_KEY"] = " "
         self.assertEqual(install.read_key(self.paths.api_key, variables), "file-secret")
 
+    def test_environment_key_never_parses_the_unused_key_file(self):
+        install.atomic_write(self.paths.api_key, b"\xff\xfe not utf-8\n", 0o644)
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "env-secret"
+        self.apply_without_prompt()
+        self.assertEqual(self.paths.api_key.read_bytes(), b"\xff\xfe not utf-8\n")
+        self.assertEqual(self.paths.api_key.stat().st_mode & 0o777, 0o600)
+        self.assertIsNone(self.ready())
+
     def test_explicit_credentials_write_files_and_name_overriding_variables(self):
         os.environ["CEREBRAS_API_KEY"] = "env-secret"
         install.atomic_write(self.paths.state / "installed.json", '{"version":"0.2.0"}\n')

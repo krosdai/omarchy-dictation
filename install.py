@@ -429,13 +429,16 @@ def ensure_api_key(path, host, prompt=getpass.getpass, replace=False, variables=
     # Name the variable, never its value; an environment key is never copied to disk.
     environment = environment_key(variables)
     if not replace:
-        stored = path.exists() and path.read_text().strip()
-        if stored:
+        if environment:
+            # The file is unused, so never parse it; still keep an old copy private.
+            if path.is_file():
+                path.parent.chmod(0o700)
+                path.chmod(0o600)
+            print(f"Using the {host} key from ${environment}; it is not written to a file.")
+            return
+        if path.exists() and path.read_text().strip():
             path.parent.chmod(0o700)
             path.chmod(0o600)
-        if environment:
-            print(f"Using the {host} key from ${environment}; it is not written to a file.")
-        if stored or environment:
             return
     elif environment:
         print(f"${environment} is set here and takes precedence over the {host} key file.")
