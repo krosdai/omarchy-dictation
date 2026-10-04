@@ -15,7 +15,9 @@
 #
 # Provider: base_url, model and reasoning_effort in
 # ~/.config/omarchy-dictation/settings.json (Cerebras by default), read on every
-# call. The key is in ~/.config/omarchy-dictation/api_key.
+# call. The key is the first non-blank of: DICTATION_LLM_API_KEY, the provider's
+# conventional variable for the base_url host (CEREBRAS_API_KEY for api.cerebras.ai,
+# see provider_key_variable), then ~/.config/omarchy-dictation/api_key.
 # Env overrides: DICTATION_LLM_API_KEY, DICTATION_LLM_API_KEY_FILE, DICTATION_LLM_BASE_URL,
 #                DICTATION_LLM_MODEL, DICTATION_LLM_SETTINGS_FILE, DICTATION_VOCABULARY_FILE.
 # Needs: bash 4+, curl, jq 1.7+.
@@ -90,6 +92,12 @@ if [ -e "$SETTINGS_FILE" ]; then
 fi
 base_url="${DICTATION_LLM_BASE_URL:-$base_url}"
 model="${DICTATION_LLM_MODEL:-$model}"
+url_host() {  # $1 = URL; prints the lower-case host without port
+  local authority="${1#*://}"
+  authority="${authority%%/*}"
+  if [[ "$authority" == \[* ]]; then authority="${authority%%]*}]"; else authority="${authority%%:*}"; fi
+  printf '%s' "${authority,,}"
+}
 # Dictated text must not cross the network in the clear. Judge the host curl will
 # actually contact: no user info, query or fragment; scheme and host ignore case.
 url_is_safe() {  # $1 = URL
@@ -97,8 +105,7 @@ url_is_safe() {  # $1 = URL
   [[ "$url" == *://* && ! "$url" =~ $bad ]] || return 1
   scheme="${url%%://*}"; authority="${url#*://}"; authority="${authority%%/*}"
   [[ -n "$authority" && "$authority" != *@* ]] || return 1
-  if [[ "$authority" == \[* ]]; then host="${authority%%]*}]"; else host="${authority%%:*}"; fi
-  host="${host,,}"
+  host="$(url_host "$url")"
   case "${scheme,,}" in
     https) [ -n "$host" ] ;;
     http) [[ "$host" == localhost || "$host" == 127.0.0.1 || "$host" == "[::1]" ]] ;;
@@ -115,7 +122,29 @@ curl_local=()
 ENDPOINT="${base_url%/}/chat/completions"
 
 # ---------------------------------------------------------------- key
-key="${DICTATION_LLM_API_KEY:-}"
+# Conventional key variables of common OpenAI-compatible hosts. A provider's
+# variable is only ever sent to that provider's host.
+# Keep in sync with PROVIDER_KEY_VARIABLES in install.py; the tests compare them.
+provider_key_variable() {  # $1 = lower-case host
+  case "$1" in
+    api.cerebras.ai) echo CEREBRAS_API_KEY ;;
+    api.openai.com) echo OPENAI_API_KEY ;;
+    api.groq.com) echo GROQ_API_KEY ;;
+    openrouter.ai) echo OPENROUTER_API_KEY ;;
+    api.mistral.ai) echo MISTRAL_API_KEY ;;
+    api.deepseek.com) echo DEEPSEEK_API_KEY ;;
+    api.together.xyz) echo TOGETHER_API_KEY ;;
+    api.fireworks.ai) echo FIREWORKS_API_KEY ;;
+    api.x.ai) echo XAI_API_KEY ;;
+    generativelanguage.googleapis.com) echo GEMINI_API_KEY ;;
+  esac
+}
+# Environment first, then the key file; blank values count as unset.
+key="${DICTATION_LLM_API_KEY:-}"; key="${key//[[:space:]]/}"
+provider_variable="$(provider_key_variable "$(url_host "$base_url")")"
+if [ -z "$key" ] && [ -n "$provider_variable" ]; then
+  key="${!provider_variable:-}"; key="${key//[[:space:]]/}"
+fi
 if [ -z "$key" ] && [ -r "$KEY_FILE" ]; then
   key="$(tr -d '[:space:]' < "$KEY_FILE")"
 fi

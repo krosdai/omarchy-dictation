@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,22 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import install  # noqa: E402
+
+real_session_environment_names = install.session_environment_names
+KEY_VARIABLES = (
+    install.TEXT_KEY_VARIABLE,
+    *install.PROVIDER_KEY_VARIABLES.values(),
+    *install.RECOGNITION_KEY_VARIABLES,
+)
+
+
+def without_key_variables(test):
+    """Keep a developer's own API keys out of tests that expect key files."""
+    environment = patch.dict(os.environ)
+    environment.start()
+    test.addCleanup(environment.stop)
+    for name in KEY_VARIABLES:
+        os.environ.pop(name, None)
 
 
 class FakeSystem:
@@ -62,6 +79,13 @@ class InstallerTests(unittest.TestCase):
         self.paths.bindings.parent.mkdir(parents=True)
         self.paths.bindings.write_text(self.bindings_original)
         self.system = FakeSystem()
+        without_key_variables(self)
+        # Never query the real desktop session; by default it matches this process.
+        session = patch.object(
+            install, "session_environment_names", return_value=set(KEY_VARIABLES)
+        )
+        self.session = session.start()
+        self.addCleanup(session.stop)
 
     def apply(self, **kwargs):
         with patch.object(install, "run", side_effect=self.system.run):
@@ -524,12 +548,18 @@ assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
             inode = marker.stat().st_ino if marker.exists() else None
             saved = []
 
-            def save(path, host, replace=False):
+            def save(path, host, replace=False, variables=()):
                 self.assertEqual(marker.stat().st_ino if marker.exists() else None, inode)
                 saved.append(path)
                 if outcome == "failure" and len(saved) == 2:
                     raise ValueError("repair failed")
-                real_save(path, host, prompt=lambda _: "repaired-key", replace=replace)
+                real_save(
+                    path,
+                    host,
+                    prompt=lambda _: "repaired-key",
+                    replace=replace,
+                    variables=variables,
+                )
 
             with (
                 self.subTest(outcome=outcome),
@@ -692,6 +722,165 @@ assert(commands[4]:match('stop %-%-operation ([%w_-]+)$') == second)
         self.assertEqual(self.paths.api_key.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(output.getvalue(), "")
 
+    def apply_without_prompt(self):
+        def prompt(_):
+            raise AssertionError("setup must not ask for a key the environment provides")
+
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(install, "run", side_effect=self.system.run):
+            install.apply(self.source, self.paths, prompt=prompt)
+        return output.getvalue()
+
+    def ready(self):
+        install.atomic_write(self.paths.runtime, "fake runtime", 0o755)
+        with (
+            patch.object(install.shutil, "which", return_value="/mock/tool"),
+            patch.object(install, "run", side_effect=self.system.run),
+        ):
+            return install.runtime_error(self.source, self.paths)
+
+    def test_environment_keys_skip_prompts_and_key_files(self):
+        os.environ["CEREBRAS_API_KEY"] = " env-text-secret\n"
+        os.environ["ELEVENLABS_API_KEY"] = "env-recognition-secret"
+        output = self.apply_without_prompt()
+        self.assertFalse(self.paths.api_key.exists())
+        self.assertFalse(self.paths.elevenlabs_api_key.exists())
+        self.assertIn("api.cerebras.ai key from $CEREBRAS_API_KEY", output)
+        self.assertIn("ElevenLabs recognition key from $ELEVENLABS_API_KEY", output)
+        self.assertNotIn("secret", output)
+        self.assertIsNone(self.ready())
+        os.environ["DICTATION_LLM_API_KEY"] = "generic-secret"
+        os.environ["CEREBRAS_API_KEY"] = ""
+        self.assertIsNone(self.ready())
+        self.assertIn("$DICTATION_LLM_API_KEY", self.apply_without_prompt())
+        for blank in ("", "  \n"):
+            with self.subTest(blank=blank):
+                os.environ["DICTATION_LLM_API_KEY"] = blank
+                self.assertIn("Credentials missing", self.ready())
+        os.environ["CEREBRAS_API_KEY"] = "env-text-secret"
+        os.environ["ELEVENLABS_API_KEY"] = " "
+        self.assertIn("Credentials missing", self.ready())
+
+    def test_provider_variable_applies_only_to_its_host(self):
+        os.environ["CEREBRAS_API_KEY"] = "cerebras-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "recognition-secret"
+        install.atomic_write(
+            self.paths.settings, json.dumps({"base_url": "https://api.openai.com/v1"})
+        )
+        with self.assertRaisesRegex(AssertionError, "must not ask"):
+            self.apply_without_prompt()
+        os.environ["OPENAI_API_KEY"] = "openai-secret"
+        self.assertIn("$OPENAI_API_KEY", self.apply_without_prompt())
+        self.assertFalse(self.paths.api_key.exists())
+        variables = {
+            "https://API.Cerebras.ai:443/v1": ("DICTATION_LLM_API_KEY", "CEREBRAS_API_KEY"),
+            "https://openrouter.ai/api/v1": ("DICTATION_LLM_API_KEY", "OPENROUTER_API_KEY"),
+            "http://localhost:11434/v1": ("DICTATION_LLM_API_KEY",),
+            "https://api.cerebras.ai.example/v1": ("DICTATION_LLM_API_KEY",),
+        }
+        for url, expected in variables.items():
+            self.assertEqual(install.text_key_variables(url), expected)
+
+    def test_environment_keys_override_existing_files_without_touching_them(self):
+        for path in (self.paths.api_key, self.paths.elevenlabs_api_key):
+            install.atomic_write(path, "file-secret\n", 0o644)
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "env-secret"
+        self.apply_without_prompt()
+        for path in (self.paths.api_key, self.paths.elevenlabs_api_key):
+            self.assertEqual(path.read_text(), "file-secret\n")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        variables = install.text_key_variables(install.DEFAULT_SETTINGS["base_url"])
+        self.assertEqual(install.read_key(self.paths.api_key, variables), "env-secret")
+        os.environ["DICTATION_LLM_API_KEY"] = "generic-secret"
+        self.assertEqual(install.read_key(self.paths.api_key, variables), "generic-secret")
+        os.environ["DICTATION_LLM_API_KEY"] = os.environ["CEREBRAS_API_KEY"] = " "
+        self.assertEqual(install.read_key(self.paths.api_key, variables), "file-secret")
+
+    def test_environment_key_never_parses_the_unused_key_file(self):
+        install.atomic_write(self.paths.api_key, b"\xff\xfe not utf-8\n", 0o644)
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "env-secret"
+        self.apply_without_prompt()
+        self.assertEqual(self.paths.api_key.read_bytes(), b"\xff\xfe not utf-8\n")
+        self.assertEqual(self.paths.api_key.stat().st_mode & 0o777, 0o600)
+        self.assertIsNone(self.ready())
+
+    def test_terminal_only_keys_warn_and_fall_back_to_key_file(self):
+        os.environ["CEREBRAS_API_KEY"] = "terminal-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "session-secret"
+        self.session.return_value = {"ELEVENLABS_API_KEY", "PATH"}
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(install, "run", side_effect=self.system.run):
+            install.apply(self.source, self.paths, prompt=lambda _: "typed-key")
+        self.assertEqual(self.paths.api_key.read_text(), "typed-key\n")
+        self.assertFalse(self.paths.elevenlabs_api_key.exists())
+        self.assertIn(
+            "$CEREBRAS_API_KEY is set in this terminal but not in your desktop session",
+            output.getvalue(),
+        )
+        self.assertIn("~/.config/uwsm/env", output.getvalue())
+        self.assertIn("key from $ELEVENLABS_API_KEY", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
+        # Once a key file exists it serves the desktop; the warning stays visible.
+        self.assertIn("not in your desktop session", self.apply_without_prompt())
+        self.assertEqual(self.paths.api_key.read_text(), "typed-key\n")
+
+    def test_unreadable_session_environment_is_not_fatal(self):
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        os.environ["ELEVENLABS_API_KEY"] = "env-secret"
+        self.session.return_value = None
+        output = self.apply_without_prompt()
+        self.assertFalse(self.paths.api_key.exists())
+        self.assertFalse(self.paths.elevenlabs_api_key.exists())
+        self.assertIn("could not be read; make sure $CEREBRAS_API_KEY is set there", output)
+        self.assertNotIn("secret", output)
+
+    def test_session_environment_names_never_fail_setup(self):
+        listing = "PATH=/usr/bin\nBLANK=\nQUOTED_BLANK=$''\nSPACES=$'  '\nQUOTED=$'a b'\n"
+        with patch.object(
+            install.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=listing),
+        ) as query:
+            self.assertEqual(real_session_environment_names(), {"PATH", "QUOTED"})
+        self.assertEqual(query.call_args.args[0], ["systemctl", "--user", "show-environment"])
+        for failure in (
+            FileNotFoundError("systemctl"),
+            subprocess.CalledProcessError(1, "systemctl"),
+            subprocess.TimeoutExpired("systemctl", 5),
+        ):
+            with (
+                self.subTest(failure=failure),
+                patch.object(install.subprocess, "run", side_effect=failure),
+            ):
+                self.assertIsNone(real_session_environment_names())
+
+    def test_explicit_credentials_write_files_and_name_overriding_variables(self):
+        os.environ["CEREBRAS_API_KEY"] = "env-secret"
+        install.atomic_write(self.paths.state / "installed.json", '{"version":"0.2.0"}\n')
+        real_save = install.ensure_api_key
+
+        def save(path, host, replace=False, variables=()):
+            real_save(
+                path, host, prompt=lambda _: "typed-secret", replace=replace, variables=variables
+            )
+
+        output = io.StringIO()
+        with (
+            redirect_stdout(output),
+            patch.object(install.Paths, "default", return_value=self.paths),
+            patch.object(sys, "argv", ["install.py", "--credentials"]),
+            patch.object(install.os, "isatty", return_value=True),
+            patch.object(install, "ensure_api_key", side_effect=save),
+        ):
+            install.main()
+        self.assertEqual(self.paths.api_key.read_text(), "typed-secret\n")
+        self.assertEqual(self.paths.elevenlabs_api_key.read_text(), "typed-secret\n")
+        self.assertIn("$CEREBRAS_API_KEY is set here and takes precedence", output.getvalue())
+        self.assertNotIn("ELEVENLABS_API_KEY", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
+
     def test_installed_script_launcher_uses_current_checkout(self):
         self.apply()
         (self.source / install.SCRIPT).write_text("printf 'updated source'\n")
@@ -810,6 +999,109 @@ class ScriptTests(unittest.TestCase):
         self.assertIn(f'DEFAULT_BASE_URL="{defaults["base_url"]}"', script)
         self.assertIn(f'DEFAULT_MODEL="{defaults["model"]}"', script)
         self.assertIn(f'DEFAULT_REASONING_EFFORT="{defaults["reasoning_effort"]}"', script)
+
+    def fake_curl(self):
+        """A curl stand-in recording the bearer key and URL; no provider is contacted."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        tools = Path(directory.name)
+        reply = {"choices": [{"message": {"content": '{"text": "Hello"}'}}]}
+        (tools / "reply.json").write_text(json.dumps(reply))
+        (tools / "curl").write_text(
+            "#!/bin/bash\n"
+            'for arg; do case "$arg" in "Authorization: Bearer "*)'
+            ' printf "%s\\n" "${arg#Authorization: Bearer }" >> "${0%/*}/keys" ;; esac; done\n'
+            'printf "%s\\n" "${@: -1}" >> "${0%/*}/urls"\n'
+            'cat "${0%/*}/reply.json"; printf "\\n200"\n'
+        )
+        (tools / "curl").chmod(0o755)
+        return tools
+
+    def sent_key(self, tools, **variables):
+        """Run dictation-llm with only the given variables; return (key sent, URL)."""
+        key_file = tools / "api_key"
+        key_file.write_text("file-key\n")
+        result = subprocess.run(
+            ["bash", str(ROOT / "dictation-llm"), "--mode", "rephrase"],
+            input="hello world",
+            capture_output=True,
+            text=True,
+            env={
+                "HOME": "/nonexistent",
+                "PATH": f"{tools}:/usr/bin:/bin",
+                "DICTATION_LLM_API_KEY_FILE": str(key_file),
+                **variables,
+            },
+            check=True,
+        )
+        self.assertEqual(result.stdout, "Hello", result.stderr)
+        sent = [(tools / name).read_text().splitlines() for name in ("keys", "urls")]
+        for name in ("keys", "urls"):
+            (tools / name).unlink()
+        self.assertEqual(len(sent[0]), 1)
+        return sent[0][0], sent[1][0]
+
+    def test_script_provider_table_matches_installer(self):
+        script = (ROOT / "dictation-llm").read_text()
+        table = script[script.index("provider_key_variable() {") :]
+        table = table[: table.index("\n}\n")]
+        self.assertEqual(
+            dict(re.findall(r"^ +([a-z0-9.-]+)\) echo ([A-Z0-9_]+) ;;$", table, re.M)),
+            install.PROVIDER_KEY_VARIABLES,
+        )
+
+    def test_script_uses_the_variable_of_the_configured_host(self):
+        tools = self.fake_curl()
+        for host, variable in install.PROVIDER_KEY_VARIABLES.items():
+            with self.subTest(host=host):
+                decoy = "OPENAI_API_KEY" if variable != "OPENAI_API_KEY" else "GROQ_API_KEY"
+                key, url = self.sent_key(
+                    tools,
+                    DICTATION_LLM_BASE_URL=f"https://{host.upper()}/v1",
+                    **{variable: f"{variable}-value", decoy: "decoy-value"},
+                )
+                self.assertEqual(key, f"{variable}-value")
+                self.assertEqual(url, f"https://{host.upper()}/v1/chat/completions")
+
+    def test_script_key_precedence_environment_over_file(self):
+        tools = self.fake_curl()
+        cerebras = {"DICTATION_LLM_BASE_URL": "https://api.cerebras.ai/v1"}
+        for variables, expected in (
+            ({"DICTATION_LLM_API_KEY": "generic", "CEREBRAS_API_KEY": "provider"}, "generic"),
+            ({"DICTATION_LLM_API_KEY": " \t", "CEREBRAS_API_KEY": "provider"}, "provider"),
+            ({"CEREBRAS_API_KEY": " provider\n"}, "provider"),
+            ({"CEREBRAS_API_KEY": "  "}, "file-key"),
+            ({"OPENAI_API_KEY": "other-provider"}, "file-key"),
+            ({}, "file-key"),
+        ):
+            with self.subTest(variables=variables):
+                self.assertEqual(self.sent_key(tools, **cerebras, **variables)[0], expected)
+        # The default provider comes from the settings file when no URL override is set.
+        self.assertEqual(self.sent_key(tools, CEREBRAS_API_KEY="from-env")[0], "from-env")
+
+    def test_clipboard_polish_uses_environment_key(self):
+        tools = self.fake_curl()
+        clipboard = tools / "clipboard"
+        clipboard.write_text("draft text\n")
+        for name, script in {
+            "wl-paste": f'#!/bin/sh\ncat "{clipboard}"\n',
+            "wl-copy": f'#!/bin/sh\ncat > "{clipboard}"\n',
+            "notify-send": "#!/bin/sh\necho 1\n",
+        }.items():
+            (tools / name).write_text(script)
+            (tools / name).chmod(0o755)
+        subprocess.run(
+            ["bash", str(ROOT / "polish-clipboard")],
+            env={
+                "HOME": "/nonexistent",
+                "PATH": f"{tools}:/usr/bin:/bin",
+                "CEREBRAS_API_KEY": "polish-env-key",
+            },
+            check=True,
+            capture_output=True,
+        )
+        self.assertEqual(clipboard.read_text(), "Hello\n")
+        self.assertEqual((tools / "keys").read_text(), "polish-env-key\n")
 
     def test_unsafe_base_urls_are_refused(self):
         for url in (

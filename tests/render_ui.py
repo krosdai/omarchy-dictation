@@ -114,7 +114,10 @@ def production(env, artifacts):
             "XDG_STATE_HOME": str(preview / "state"),
             "XDG_DATA_HOME": str(preview / "data"),
             "PATH": str(tools) + os.pathsep + env["PATH"],
+            # Environment keys win over files; keep the missing-credentials state real.
+            **{name: "" for name in env if name.endswith("_API_KEY")},
             "ELEVENLABS_API_KEY": "",
+            "DICTATION_LLM_API_KEY": "",
             "HYPRLAND_INSTANCE_SIGNATURE": "",
         }
         log_path = artifacts / "service-render.log"

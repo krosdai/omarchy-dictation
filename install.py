@@ -67,6 +67,26 @@ DEFAULT_SETTINGS = {
     "microphone": "auto",
 }
 
+# Keys already present in the session environment win over the private key files.
+# The generic override applies to any text provider; a provider-specific variable is
+# used only for the host it belongs to, so switching base_url never sends one
+# provider's key to another. dictation-llm keeps its own copy of this table; the
+# tests compare the two.
+TEXT_KEY_VARIABLE = "DICTATION_LLM_API_KEY"
+PROVIDER_KEY_VARIABLES = {
+    "api.cerebras.ai": "CEREBRAS_API_KEY",
+    "api.openai.com": "OPENAI_API_KEY",
+    "api.groq.com": "GROQ_API_KEY",
+    "openrouter.ai": "OPENROUTER_API_KEY",
+    "api.mistral.ai": "MISTRAL_API_KEY",
+    "api.deepseek.com": "DEEPSEEK_API_KEY",
+    "api.together.xyz": "TOGETHER_API_KEY",
+    "api.fireworks.ai": "FIREWORKS_API_KEY",
+    "api.x.ai": "XAI_API_KEY",
+    "generativelanguage.googleapis.com": "GEMINI_API_KEY",
+}
+RECOGNITION_KEY_VARIABLES = ("ELEVENLABS_API_KEY",)
+
 
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, text=True, **kwargs).stdout
@@ -177,6 +197,65 @@ def load_settings(path):
 
 def api_host(settings):
     return urllib.parse.urlsplit(settings["base_url"]).netloc
+
+
+def text_key_variables(base_url):
+    """Environment variables that may hold the text-provider key, in precedence order."""
+    provider = PROVIDER_KEY_VARIABLES.get(urllib.parse.urlsplit(base_url).hostname or "")
+    return (TEXT_KEY_VARIABLE, provider) if provider else (TEXT_KEY_VARIABLE,)
+
+
+def environment_key(variables):
+    """Name of the first variable holding a key; blank values count as unset."""
+    return next((name for name in variables if os.environ.get(name, "").strip()), None)
+
+
+def read_key(path, variables=()):
+    """The key from the environment if set there, otherwise from its private file."""
+    name = environment_key(variables)
+    if name:
+        return os.environ[name].strip()
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def session_environment_names():
+    """Variables set non-blank in the systemd user environment, or None if unreadable.
+
+    uwsm runs Hyprland, and through it omarchy-shell, from this environment, so a key
+    exported only by an interactive shell never reaches the backend or the hotkeys.
+    Only names leave this function; values are never logged.
+    """
+    try:
+        listing = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            check=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    names = set()
+    for line in listing.splitlines():
+        name, _, value = line.partition("=")
+        # systemctl quotes values containing special characters as $'...'.
+        if value.startswith("$'") and value.endswith("'"):
+            value = value[2:-1]
+        if value.strip():
+            names.add(name)
+    return names
+
+
+def credential_sources(paths, settings):
+    """(label, key file, environment variables) for the text and recognition keys."""
+    return (
+        (api_host(settings), paths.api_key, text_key_variables(settings["base_url"])),
+        ("ElevenLabs recognition", paths.elevenlabs_api_key, RECOGNITION_KEY_VARIABLES),
+    )
 
 
 def _is_chord(value):
@@ -373,13 +452,39 @@ def remove_files(paths, marker):
         (paths.bin_dir / name).unlink()
 
 
-def ensure_api_key(path, host, prompt=getpass.getpass, replace=False):
+def ensure_api_key(path, host, prompt=getpass.getpass, replace=False, variables=()):
     if path.is_symlink():
         raise ValueError("Private credential files must not be symlinks")
-    if not replace and path.exists() and path.read_text().strip():
-        path.parent.chmod(0o700)
-        path.chmod(0o600)
-        return
+    # Name the variable, never its value; an environment key is never copied to disk.
+    environment = environment_key(variables)
+    session = session_environment_names() if environment else None
+    if environment and session is not None and environment not in session:
+        # A hand-run setup may see keys the desktop session does not have.
+        print(
+            f"${environment} is set in this terminal but not in your desktop session, so "
+            "dictation cannot use it.\n  To rely on it, export it in ~/.config/uwsm/env "
+            "and log in again; until then the key file is used."
+        )
+        environment = None
+    if not replace:
+        if environment:
+            # The file is unused, so never parse it; still keep an old copy private.
+            if path.is_file():
+                path.parent.chmod(0o700)
+                path.chmod(0o600)
+            print(f"Using the {host} key from ${environment}; it is not written to a file.")
+            if session is None:
+                print(
+                    "  The desktop session environment could not be read; make sure "
+                    f"${environment} is set there too, e.g. in ~/.config/uwsm/env."
+                )
+            return
+        if path.exists() and path.read_text().strip():
+            path.parent.chmod(0o700)
+            path.chmod(0o600)
+            return
+    elif environment:
+        print(f"${environment} is set here and takes precedence over the {host} key file.")
     key = prompt(f"API key for {host} (input hidden, stored in {path}): ").strip()
     if not key:
         raise ValueError(
@@ -452,9 +557,9 @@ def runtime_error(source, paths):
         if shutil.which(tool) is None:
             return f"Required command not found: {tool}"
     try:
-        load_settings(paths.settings)
-        for key in (paths.api_key, paths.elevenlabs_api_key):
-            if not key.read_text().strip():
+        settings = load_settings(paths.settings)
+        for _, path, variables in credential_sources(paths, settings):
+            if not read_key(path, variables):
                 return "Credentials missing; open credential setup in a terminal."
         run(
             str(paths.runtime),
@@ -521,8 +626,8 @@ def apply(source, paths, remove=False, prompt=getpass.getpass):
         for name in ("voice.py", SCRIPT, WRAPPER, "vocabulary.example.txt"):
             if (source / name).is_symlink() or not (source / name).is_file():
                 raise ValueError(f"Expected a regular source file: {source / name}")
-        ensure_api_key(paths.api_key, api_host(settings), prompt)
-        ensure_api_key(paths.elevenlabs_api_key, "ElevenLabs recognition", prompt)
+        for label, path, variables in credential_sources(paths, settings):
+            ensure_api_key(path, label, prompt, variables=variables)
         provision_runtime(paths)
     paths.state.mkdir(parents=True, exist_ok=True)
     backup = Path(tempfile.mkdtemp(prefix="backup-", dir=paths.state))
@@ -624,8 +729,8 @@ def main():
             run("omarchy-launch-floating-terminal-with-presentation", command)
             return
         settings = load_settings(paths.settings)
-        ensure_api_key(paths.api_key, api_host(settings), replace=True)
-        ensure_api_key(paths.elevenlabs_api_key, "ElevenLabs recognition", replace=True)
+        for label, path, variables in credential_sources(paths, settings):
+            ensure_api_key(path, label, replace=True, variables=variables)
         marker = paths.state / "installed.json"
         if marker.is_file() and not marker.is_symlink():
             atomic_write(marker, marker.read_bytes())
